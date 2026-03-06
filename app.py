@@ -112,11 +112,10 @@ def load_employee_inputs(sb, planning_round_id: int):
     return result.data or []
 
 
-def load_employees_for_round(sb, planning_round_id: int):
+def load_active_employees(sb):
     result = (
-        sb.table("employees")
+        sb.table("employees_master")
         .select("*")
-        .eq("planning_round_id", planning_round_id)
         .eq("active", True)
         .order("name")
         .order("id")
@@ -285,10 +284,6 @@ def build_input_overview_excel(
     buffer.seek(0)
     return buffer.getvalue()
 
-
-# =========================
-# Scheduler-Logik
-# =========================
 
 def requirement_for_day(day: int, month: int, year: int) -> DayRequirement:
     wd = date(year, month, day).weekday()
@@ -680,10 +675,6 @@ def build_schedule_excel(
     return buffer.getvalue()
 
 
-# =========================
-# Streamlit UI
-# =========================
-
 st.set_page_config(page_title="Dienstplan Mitarbeitereingabe", layout="wide")
 st.title("Dienstplan Mitarbeitereingabe")
 
@@ -700,10 +691,10 @@ planning_round_id = round_row["id"]
 
 st.success(f"Planungsrunde aktiv: {round_row['title']}")
 
-employees_master = load_employees_for_round(sb, planning_round_id)
+employees_master = load_active_employees(sb)
 
 if not employees_master:
-    st.error("Keine Mitarbeitenden für diese Planungsrunde in der Tabelle 'employees' gefunden.")
+    st.error("Keine aktiven Mitarbeitenden in 'employees_master' gefunden.")
     st.stop()
 
 rows = load_employee_inputs(sb, planning_round_id)
