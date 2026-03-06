@@ -1,5 +1,5 @@
 import calendar
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import streamlit as st
 from supabase import create_client
@@ -36,6 +36,7 @@ def get_day_label(day: int, month: int, year: int) -> str:
 
 def get_or_create_planning_round(sb, month: int, year: int):
     title = f"Dienstplan {month:02d}/{year}"
+
     existing = (
         sb.table("planning_rounds")
         .select("*")
@@ -67,7 +68,7 @@ def load_employee_inputs(sb, planning_round_id: int):
         .order("name")
         .execute()
     )
-    return result.data
+    return result.data or []
 
 
 def load_employees_for_round(sb, planning_round_id: int):
@@ -77,9 +78,37 @@ def load_employees_for_round(sb, planning_round_id: int):
         .eq("planning_round_id", planning_round_id)
         .eq("active", True)
         .order("name")
+        .order("id")
         .execute()
     )
-    return result.data
+    rows = result.data or []
+
+    # Defensive Entdoppelung:
+    # Falls in Supabase dieselbe Person mehrfach existiert, nehmen wir nur den ersten Datensatz pro Name.
+    unique_by_name = {}
+    for row in rows:
+        name = (row.get("name") or "").strip()
+        if not name:
+            continue
+        if name not in unique_by_name:
+            unique_by_name[name] = row
+
+    return list(unique_by_name.values())
+
+
+def load_existing_input_for_name(sb, planning_round_id: int, name: str):
+    result = (
+        sb.table("employee_inputs")
+        .select("*")
+        .eq("planning_round_id", planning_round_id)
+        .eq("name", name)
+        .limit(1)
+        .execute()
+    )
+
+    if result.data:
+        return result.data[0]
+    return None
 
 
 def save_employee_input(
@@ -111,7 +140,7 @@ def save_employee_input(
         "wants_8_block": wants_8_block,
         "availability": availability,
         "submitted": True,
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
     if existing.data:
@@ -122,7 +151,11 @@ def save_employee_input(
             .execute()
         )
 
-    return sb.table("employee_inputs").insert(payload).execute()
+    return (
+        sb.table("employee_inputs")
+        .insert(payload)
+        .execute()
+    )
 
 
 st.set_page_config(page_title="Dienstplan Mitarbeitereingabe", layout="wide")
@@ -147,18 +180,19 @@ if not employees_master:
     st.error("Keine Mitarbeitenden für diese Planungsrunde in der Tabelle 'employees' gefunden.")
     st.stop()
 
-st.subheader("Status der Mitarbeitereingaben")
 rows = load_employee_inputs(sb, planning_round_id)
 
+# Dictionary: Name -> gespeicherter Input
 submitted_by_name = {
     row["name"]: row
     for row in rows
     if row.get("submitted")
 }
 
+st.subheader("Status der Mitarbeitereingaben")
+
 total_count = len(employees_master)
 submitted_count = len(submitted_by_name)
-missing_count = total_count - submitted_count
 
 st.info(f"{submitted_count} von {total_count} Mitarbeitenden haben bereits eingetragen.")
 
@@ -170,43 +204,78 @@ for emp in employees_master:
     else:
         st.write(f"❌ **{name}** — noch offen")
 
+missing_names = [
+    emp["name"]
+    for emp in employees_master
+    if emp["name"] not in submitted_by_name
+]
+
+if missing_names:
+    st.warning("Noch offen: " + ", ".join(missing_names))
+else:
+    st.success("Alle Mitarbeitenden haben ihre Eingaben abgegeben.")
+
 st.markdown("---")
 st.subheader("Eigene Daten eintragen")
 
 employee_options = [emp["name"] for emp in employees_master]
 
+selected_name = st.selectbox("Mitarbeiter auswählen", employee_options)
+
+selected_employee = next(emp for emp in employees_master if emp["name"] == selected_name)
+
+name = selected_employee["name"]
+is_fachkraft = selected_employee["is_fachkraft"]
+min_services = selected_employee["min_services"]
+max_services = selected_employee["max_services"]
+
+st.info(
+    f"Stammdaten für **{name}**: "
+    f"Fachkraft: {'Ja' if is_fachkraft else 'Nein'}, "
+    f"Min-Dienste: {min_services}, Max-Dienste: {max_services}"
+)
+
+existing_input = load_existing_input_for_name(sb, planning_round_id, selected_name)
+
+default_blocks = [2]
+default_wants_8 = False
+default_availability = [True] * days_in_month
+
+if existing_input:
+    loaded_blocks = existing_input.get("block_preferences") or []
+    loaded_wants_8 = existing_input.get("wants_8_block", False)
+    loaded_availability = existing_input.get("availability") or []
+
+    if isinstance(loaded_blocks, list):
+        default_blocks = [int(x) for x in loaded_blocks if str(x).isdigit() or isinstance(x, int)]
+
+    default_wants_8 = bool(loaded_wants_8)
+
+    if isinstance(loaded_availability, list) and len(loaded_availability) == days_in_month:
+        default_availability = [bool(x) for x in loaded_availability]
+
 with st.form("employee_form"):
-    selected_name = st.selectbox("Mitarbeiter auswählen", employee_options)
-    selected_employee = next(emp for emp in employees_master if emp["name"] == selected_name)
-
-    name = selected_employee["name"]
-    is_fachkraft = selected_employee["is_fachkraft"]
-    min_services = selected_employee["min_services"]
-    max_services = selected_employee["max_services"]
-
-    st.info(
-        f"Stammdaten für **{name}**: "
-        f"Fachkraft: {'Ja' if is_fachkraft else 'Nein'}, "
-        f"Min-Dienste: {min_services}, Max-Dienste: {max_services}"
-    )
-
     block_preferences = st.multiselect(
         "Bevorzugte Blockgrößen",
         options=[1, 2, 3, 4],
-        default=[2],
+        default=default_blocks,
     )
 
-    wants_8_block = st.checkbox("8er-Block-Wunsch (4 + frei + 4)")
+    wants_8_block = st.checkbox(
+        "8er-Block-Wunsch (4 + frei + 4)",
+        value=default_wants_8,
+    )
 
     st.write("Verfügbarkeit")
     availability = []
     cols = st.columns(7)
+
     for d in range(1, days_in_month + 1):
         with cols[(d - 1) % 7]:
             available = st.checkbox(
                 get_day_label(d, int(month), int(year)),
-                value=True,
-                key=f"{selected_name}_day_{d}",
+                value=default_availability[d - 1],
+                key=f"{selected_name}_day_{month}_{year}_{d}",
             )
             availability.append(available)
 
@@ -235,7 +304,7 @@ if submitted:
                 min_services=int(min_services),
                 max_services=int(max_services),
                 block_preferences=list(block_preferences),
-                wants_8_block=wants_8_block,
+                wants_8_block=bool(wants_8_block),
                 availability=availability,
             )
             st.success("Deine Daten wurden gespeichert.")
