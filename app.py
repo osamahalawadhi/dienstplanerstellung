@@ -70,6 +70,18 @@ def load_employee_inputs(sb, planning_round_id: int):
     return result.data
 
 
+def load_employees_for_round(sb, planning_round_id: int):
+    result = (
+        sb.table("employees")
+        .select("*")
+        .eq("planning_round_id", planning_round_id)
+        .eq("active", True)
+        .order("name")
+        .execute()
+    )
+    return result.data
+
+
 def save_employee_input(
     sb,
     planning_round_id: int,
@@ -129,6 +141,12 @@ planning_round_id = round_row["id"]
 
 st.success(f"Planungsrunde aktiv: {round_row['title']}")
 
+employees_master = load_employees_for_round(sb, planning_round_id)
+
+if not employees_master:
+    st.error("Keine Mitarbeitenden für diese Planungsrunde in der Tabelle 'employees' gefunden.")
+    st.stop()
+
 st.subheader("Bereits eingegangene Mitarbeitereingaben")
 rows = load_employee_inputs(sb, planning_round_id)
 
@@ -143,9 +161,76 @@ else:
 st.markdown("---")
 st.subheader("Eigene Daten eintragen")
 
+employee_options = [emp["name"] for emp in employees_master]
+
 with st.form("employee_form"):
-    name = st.text_input("Name")
-    is_fachkraft = st.checkbox("Fachkraft")
+    selected_name = st.selectbox("Mitarbeiter auswählen", employee_options)
+    selected_employee = next(emp for emp in employees_master if emp["name"] == selected_name)
+
+    name = selected_employee["name"]
+    is_fachkraft = selected_employee["is_fachkraft"]
+    min_services = selected_employee["min_services"]
+    max_services = selected_employee["max_services"]
+
+    st.info(
+        f"Stammdaten für **{name}**: "
+        f"Fachkraft: {'Ja' if is_fachkraft else 'Nein'}, "
+        f"Min-Dienste: {min_services}, Max-Dienste: {max_services}"
+    )
+
+    block_preferences = st.multiselect(
+        "Bevorzugte Blockgrößen",
+        options=[1, 2, 3, 4],
+        default=[2],
+    )
+
+    wants_8_block = st.checkbox("8er-Block-Wunsch (4 + frei + 4)")
+
+    st.write("Verfügbarkeit")
+    availability = []
+    cols = st.columns(7)
+    for d in range(1, days_in_month + 1):
+        with cols[(d - 1) % 7]:
+            available = st.checkbox(
+                get_day_label(d, int(month), int(year)),
+                value=True,
+                key=f"{selected_name}_day_{d}",
+            )
+            availability.append(available)
+
+    submitted = st.form_submit_button("Speichern")
+
+if submitted:
+    errors = []
+
+    if not name.strip():
+        errors.append("Name fehlt.")
+    if max_services < min_services:
+        errors.append("Max-Dienste dürfen nicht kleiner als Min-Dienste sein.")
+    if not block_preferences and not wants_8_block:
+        errors.append("Mindestens ein Blockwunsch oder 8er-Wunsch ist erforderlich.")
+
+    if errors:
+        for err in errors:
+            st.error(err)
+    else:
+        try:
+            save_employee_input(
+                sb=sb,
+                planning_round_id=planning_round_id,
+                name=name.strip(),
+                is_fachkraft=is_fachkraft,
+                min_services=int(min_services),
+                max_services=int(max_services),
+                block_preferences=list(block_preferences),
+                wants_8_block=wants_8_block,
+                availability=availability,
+            )
+            st.success("Deine Daten wurden gespeichert.")
+            st.rerun()
+        except Exception as e:
+            st.error("Speichern fehlgeschlagen.")
+            st.exception(e)    is_fachkraft = st.checkbox("Fachkraft")
     c1, c2 = st.columns(2)
     with c1:
         min_services = st.number_input("Min-Dienste", min_value=0, max_value=31, value=8)
