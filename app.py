@@ -745,23 +745,23 @@ selected_employee = next(emp for emp in employees_master if emp["name"] == selec
 
 employee_id = selected_employee["id"]
 name = selected_employee["name"]
-is_fachkraft = selected_employee["is_fachkraft"]
-min_services = selected_employee["min_services"]
-max_services = selected_employee["max_services"]
 
-st.info(
-    f"Stammdaten für **{name}**: "
-    f"Fachkraft: {'Ja' if is_fachkraft else 'Nein'}, "
-    f"Min-Dienste: {min_services}, Max-Dienste: {max_services}"
-)
+st.info(f"Mitarbeiter: **{name}**")
 
 existing_input = load_existing_input_for_employee(sb, planning_round_id, employee_id)
 
+default_is_fachkraft = False
+default_min_services = 8
+default_max_services = 15
 default_blocks = [2]
 default_wants_8 = False
 default_availability = [True] * days_in_month
 
 if existing_input:
+    default_is_fachkraft = bool(existing_input.get("is_fachkraft", False))
+    default_min_services = int(existing_input.get("min_services", 8))
+    default_max_services = int(existing_input.get("max_services", 15))
+
     loaded_blocks = existing_input.get("block_preferences") or []
     loaded_wants_8 = existing_input.get("wants_8_block", False)
     loaded_availability = existing_input.get("availability") or []
@@ -781,6 +781,29 @@ if existing_input:
         default_availability = [bool(x) for x in loaded_availability]
 
 with st.form("employee_form"):
+    is_fachkraft = st.checkbox(
+        "Fachkraft",
+        value=default_is_fachkraft,
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        min_services = st.number_input(
+            "Min-Dienste",
+            min_value=0,
+            max_value=31,
+            value=default_min_services,
+            step=1,
+        )
+    with c2:
+        max_services = st.number_input(
+            "Max-Dienste",
+            min_value=0,
+            max_value=31,
+            value=default_max_services,
+            step=1,
+        )
+
     block_preferences = st.multiselect(
         "Bevorzugte Blockgrößen",
         options=[1, 2, 3, 4],
@@ -827,7 +850,7 @@ if submitted:
                 planning_round_id=planning_round_id,
                 employee_id=employee_id,
                 name=name.strip(),
-                is_fachkraft=is_fachkraft,
+                is_fachkraft=bool(is_fachkraft),
                 min_services=int(min_services),
                 max_services=int(max_services),
                 block_preferences=list(block_preferences),
