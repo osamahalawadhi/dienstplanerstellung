@@ -274,6 +274,36 @@ def build_employees_from_inputs(sb, planning_round_id: int, days_in_month: int) 
     return employees
 
 
+def filter_user_warnings(warnings: List[str]) -> List[str]:
+    """
+    Zeigt nur wirklich wichtige Warnungen an.
+    Technische Planungs-/Debug-Meldungen werden ausgeblendet.
+    """
+    important_prefixes = [
+        "Unterbesetzung",
+        "Unterbesetzung final",
+        "Keine Fachkraft",
+        "Keine Fachkraft final",
+        "Wochenende unterbesetzt",
+        "Keine Fachkraft am Wochenende",
+        "Min-Dienste nicht erreicht",
+    ]
+
+    filtered = []
+    for w in warnings:
+        if any(w.startswith(prefix) for prefix in important_prefixes):
+            filtered.append(w)
+
+    unique_filtered = []
+    seen = set()
+    for w in filtered:
+        if w not in seen:
+            unique_filtered.append(w)
+            seen.add(w)
+
+    return unique_filtered
+
+
 def build_input_overview_excel(
     employees: List[Employee],
     month: int,
@@ -336,9 +366,9 @@ def requirement_for_day(day: int, month: int, year: int) -> DayRequirement:
     - Montag bis Donnerstag: mindestens 2 Personen, Ziel 3, mindestens 1 Fachkraft
     - Freitag bis Sonntag: 3 Personen, mindestens 1 Fachkraft
     """
-    wd = date(year, month, day).weekday()  # Mo=0 ... So=6
+    wd = date(year, month, day).weekday()
 
-    if wd >= 4:  # Freitag, Samstag, Sonntag
+    if wd >= 4:
         return DayRequirement(
             target=3,
             minimum=3,
@@ -517,12 +547,6 @@ def fill_day_with_fallback_workers(
     days_in_month: int,
     target_override: Optional[int] = None,
 ) -> List[int]:
-    """
-    Falls Wunschblöcke nicht reichen, mit 1er-Blöcken auffüllen.
-    target_override:
-      - None => normales Ziel laut Tagesregel
-      - Zahl => explizit nur bis zu diesem Ziel auffüllen
-    """
     req = requirement_for_day(day, month, year)
     target = target_override if target_override is not None else req.target
 
@@ -588,12 +612,6 @@ def ensure_minimum_coverage_for_day(
     days_in_month: int,
     warnings: List[str],
 ) -> List[int]:
-    """
-    Stufe 1:
-    Für jeden Tag zuerst Mindestabdeckung sicherstellen:
-    - mindestens 2 Personen
-    - mindestens 1 Fachkraft
-    """
     req = requirement_for_day(day, month, year)
     assigned = get_locked_workers_for_day(employees, day)
 
@@ -674,24 +692,10 @@ def generate_schedule(
     year: int,
     days_in_month: int,
 ) -> Tuple[List[List[int]], List[str], List[Employee]]:
-    """
-    Prioritätslogik:
-
-    Phase A:
-      Alle Tage zuerst auf Mindestbesetzung bringen:
-      - mindestens 2 Personen
-      - mindestens 1 Fachkraft
-
-    Phase B:
-      Wochenenden (Fr/Sa/So) auf 3 Personen bringen
-
-    Phase C:
-      Wochentage optional von 2 auf 3 auffüllen
-    """
     employees = copy.deepcopy(employees_input)
     warnings: List[str] = []
 
-    # Phase A: Mindestabdeckung
+    # Phase A: zuerst alle Tage auf Mindestabdeckung bringen
     for day in range(1, days_in_month + 1):
         assigned = ensure_minimum_coverage_for_day(
             employees=employees,
@@ -713,7 +717,7 @@ def generate_schedule(
                 f"Keine Fachkraft an {get_day_label(day, month, year)} eingeplant."
             )
 
-    # Phase B: Wochenende auf 3
+    # Phase B: Wochenenden auf 3
     for day in range(1, days_in_month + 1):
         req = requirement_for_day(day, month, year)
         if not req.exact_target:
@@ -814,7 +818,6 @@ def generate_schedule(
                 target_override=3,
             )
 
-    # Finalisierung
     assignments_by_day: List[List[int]] = [[] for _ in range(days_in_month)]
 
     for day in range(1, days_in_month + 1):
@@ -836,12 +839,6 @@ def generate_schedule(
         if count_fachkraft(employees, assigned) == 0:
             warnings.append(
                 f"Keine Fachkraft final an {get_day_label(day, month, year)}."
-            )
-
-        if not req.exact_target and len(assigned) == req.minimum:
-            warnings.append(
-                f"Wochentag nur Mindestbesetzung an {get_day_label(day, month, year)}: "
-                f"{len(assigned)} statt Ziel {req.target}."
             )
 
     for emp in employees:
@@ -918,7 +915,8 @@ def build_schedule_excel(
     ws2["A1"].font = Font(bold=True)
     ws2.column_dimensions["A"].width = 140
 
-    for i, warning in enumerate(warnings, start=2):
+    important_warnings = filter_user_warnings(warnings)
+    for i, warning in enumerate(important_warnings, start=2):
         ws2[f"A{i}"] = warning
 
     ws3 = wb.create_sheet("Statistik")
@@ -1228,6 +1226,8 @@ if admin_mode:
                 days_in_month=days_in_month,
             )
 
+            important_warnings = filter_user_warnings(warnings)
+
             st.success("Dienstplan wurde erstellt.")
 
             st.download_button(
@@ -1238,10 +1238,10 @@ if admin_mode:
             )
 
             st.subheader("Warnungen")
-            if warnings:
-                for warning in warnings:
+            if important_warnings:
+                for warning in important_warnings:
                     st.warning(warning)
             else:
-                st.info("Keine Warnungen.")
+                st.info("Keine wichtigen Warnungen.")
     else:
         st.warning("Noch keine vollständigen Mitarbeitereingaben vorhanden.")
