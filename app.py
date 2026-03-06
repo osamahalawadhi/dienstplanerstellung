@@ -123,23 +123,23 @@ def load_active_employees(sb):
     )
     rows = result.data or []
 
-    unique_by_name = {}
+    unique_by_id = {}
     for row in rows:
-        name = (row.get("name") or "").strip()
-        if not name:
+        emp_id = row.get("id")
+        if emp_id is None:
             continue
-        if name not in unique_by_name:
-            unique_by_name[name] = row
+        if emp_id not in unique_by_id:
+            unique_by_id[emp_id] = row
 
-    return list(unique_by_name.values())
+    return list(unique_by_id.values())
 
 
-def load_existing_input_for_name(sb, planning_round_id: int, name: str):
+def load_existing_input_for_employee(sb, planning_round_id: int, employee_id: int):
     result = (
         sb.table("employee_inputs")
         .select("*")
         .eq("planning_round_id", planning_round_id)
-        .eq("name", name)
+        .eq("employee_id", employee_id)
         .limit(1)
         .execute()
     )
@@ -152,6 +152,7 @@ def load_existing_input_for_name(sb, planning_round_id: int, name: str):
 def save_employee_input(
     sb,
     planning_round_id: int,
+    employee_id: int,
     name: str,
     is_fachkraft: bool,
     min_services: int,
@@ -164,12 +165,13 @@ def save_employee_input(
         sb.table("employee_inputs")
         .select("id")
         .eq("planning_round_id", planning_round_id)
-        .eq("name", name)
+        .eq("employee_id", employee_id)
         .execute()
     )
 
     payload = {
         "planning_round_id": planning_round_id,
+        "employee_id": employee_id,
         "name": name,
         "is_fachkraft": is_fachkraft,
         "min_services": min_services,
@@ -699,23 +701,25 @@ if not employees_master:
 
 rows = load_employee_inputs(sb, planning_round_id)
 
-submitted_by_name = {
-    row["name"]: row
+submitted_by_employee_id = {
+    row["employee_id"]: row
     for row in rows
-    if row.get("submitted")
+    if row.get("submitted") and row.get("employee_id") is not None
 }
 
 st.subheader("Status der Mitarbeitereingaben")
 
 total_count = len(employees_master)
-submitted_count = len(submitted_by_name)
+submitted_count = len(submitted_by_employee_id)
 
 st.info(f"{submitted_count} von {total_count} Mitarbeitenden haben bereits eingetragen.")
 
 for emp in employees_master:
+    emp_id = emp["id"]
     name = emp["name"]
-    if name in submitted_by_name:
-        updated_at = submitted_by_name[name].get("updated_at", "")
+
+    if emp_id in submitted_by_employee_id:
+        updated_at = submitted_by_employee_id[emp_id].get("updated_at", "")
         st.write(f"✅ **{name}** — eingetragen — zuletzt geändert: {updated_at}")
     else:
         st.write(f"❌ **{name}** — noch offen")
@@ -723,7 +727,7 @@ for emp in employees_master:
 missing_names = [
     emp["name"]
     for emp in employees_master
-    if emp["name"] not in submitted_by_name
+    if emp["id"] not in submitted_by_employee_id
 ]
 
 if missing_names:
@@ -739,6 +743,7 @@ selected_name = st.selectbox("Mitarbeiter auswählen", employee_options)
 
 selected_employee = next(emp for emp in employees_master if emp["name"] == selected_name)
 
+employee_id = selected_employee["id"]
 name = selected_employee["name"]
 is_fachkraft = selected_employee["is_fachkraft"]
 min_services = selected_employee["min_services"]
@@ -750,7 +755,7 @@ st.info(
     f"Min-Dienste: {min_services}, Max-Dienste: {max_services}"
 )
 
-existing_input = load_existing_input_for_name(sb, planning_round_id, selected_name)
+existing_input = load_existing_input_for_employee(sb, planning_round_id, employee_id)
 
 default_blocks = [2]
 default_wants_8 = False
@@ -796,7 +801,7 @@ with st.form("employee_form"):
             available = st.checkbox(
                 get_day_label(d, int(month), int(year)),
                 value=default_availability[d - 1],
-                key=f"{selected_name}_day_{month}_{year}_{d}",
+                key=f"{employee_id}_day_{month}_{year}_{d}",
             )
             availability.append(available)
 
@@ -820,6 +825,7 @@ if submitted:
             save_employee_input(
                 sb=sb,
                 planning_round_id=planning_round_id,
+                employee_id=employee_id,
                 name=name.strip(),
                 is_fachkraft=is_fachkraft,
                 min_services=int(min_services),
