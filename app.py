@@ -331,10 +331,27 @@ def build_input_overview_excel(
 
 
 def requirement_for_day(day: int, month: int, year: int) -> DayRequirement:
-    wd = date(year, month, day).weekday()
-    if wd >= 4:
-        return DayRequirement(target=3, minimum=3, needs_fachkraft=True, exact_target=True)
-    return DayRequirement(target=3, minimum=2, needs_fachkraft=True, exact_target=False)
+    """
+    Besetzungsregel:
+    - Montag bis Donnerstag: mindestens 2 Personen, Ziel 3, mindestens 1 Fachkraft
+    - Freitag bis Sonntag: 3 Personen, mindestens 1 Fachkraft
+    """
+    wd = date(year, month, day).weekday()  # Mo=0 ... So=6
+
+    if wd >= 4:  # Freitag, Samstag, Sonntag
+        return DayRequirement(
+            target=3,
+            minimum=3,
+            needs_fachkraft=True,
+            exact_target=True,
+        )
+
+    return DayRequirement(
+        target=3,
+        minimum=2,
+        needs_fachkraft=True,
+        exact_target=False,
+    )
 
 
 def count_fachkraft(employees: List[Employee], assigned_ids: List[int]) -> int:
@@ -585,7 +602,14 @@ def generate_schedule(
 
         while len(assigned) < req.target:
             need_fk_now = req.needs_fachkraft and count_fachkraft(employees, assigned) == 0
-            best = find_best_block_start(employees, day, month, year, need_fachkraft_now=need_fk_now, days_in_month=days_in_month)
+            best = find_best_block_start(
+                employees,
+                day,
+                month,
+                year,
+                need_fachkraft_now=need_fk_now,
+                days_in_month=days_in_month,
+            )
 
             if best is None:
                 break
@@ -619,6 +643,12 @@ def generate_schedule(
 
         if req.needs_fachkraft and count_fachkraft(employees, assigned) == 0:
             warnings.append(f"Keine Fachkraft an {get_day_label(day, month, year)} eingeplant.")
+
+        if not req.exact_target and len(assigned) == req.minimum:
+            warnings.append(
+                f"Wochentag nur Mindestbesetzung an {get_day_label(day, month, year)}: "
+                f"{len(assigned)} statt Ziel {req.target}."
+            )
 
         update_states_for_day(employees, day, assigned)
 
