@@ -515,10 +515,18 @@ def fill_day_with_fallback_workers(
     assigned: List[int],
     warnings: List[str],
     days_in_month: int,
+    target_override: Optional[int] = None,
 ) -> List[int]:
+    """
+    Falls Wunschblöcke nicht reichen, mit 1er-Blöcken auffüllen.
+    target_override:
+      - None => normales Ziel laut Tagesregel
+      - Zahl => explizit nur bis zu diesem Ziel auffüllen
+    """
     req = requirement_for_day(day, month, year)
+    target = target_override if target_override is not None else req.target
 
-    while len(assigned) < req.target:
+    while len(assigned) < target:
         need_fk_now = req.needs_fachkraft and count_fachkraft(employees, assigned) == 0
 
         fallback_candidates: List[Tuple[int, int]] = []
@@ -531,8 +539,15 @@ def fill_day_with_fallback_workers(
             pattern = ["work"]
             if not can_start_block(emp, day, pattern, days_in_month):
                 continue
-            if not block_respects_future_capacity(employees, day, pattern, month, year, i):
-                continue
+
+            if target_override is None:
+                if not block_respects_future_capacity(employees, day, pattern, month, year, i):
+                    continue
+            else:
+                already = get_locked_workers_for_day(employees, day)
+                future_count = len(already) + (0 if i in already else 1)
+                if future_count > target:
+                    continue
 
             score = 0
             if len(emp.locked_work_days) < emp.min_services:
@@ -556,12 +571,86 @@ def fill_day_with_fallback_workers(
         _, emp_idx = fallback_candidates[0]
         lock_block(employees[emp_idx], day, ["work"])
         assigned = get_locked_workers_for_day(employees, day)
+
         warnings.append(
-            f"Fallback an {get_day_label(day, month, year)}: {employees[emp_idx].name} "
-            f"wurde mit 1er-Block ergänzt, weil kein passender Wunschblock mehr möglich war."
+            f"Fallback an {get_day_label(day, month, year)}: "
+            f"{employees[emp_idx].name} wurde mit 1er-Block ergänzt."
         )
 
     return assigned
+
+
+def ensure_minimum_coverage_for_day(
+    employees: List[Employee],
+    day: int,
+    month: int,
+    year: int,
+    days_in_month: int,
+    warnings: List[str],
+) -> List[int]:
+    """
+    Stufe 1:
+    Für jeden Tag zuerst Mindestabdeckung sicherstellen:
+    - mindestens 2 Personen
+    - mindestens 1 Fachkraft
+    """
+    req = requirement_for_day(day, month, year)
+    assigned = get_locked_workers_for_day(employees, day)
+
+    if count_fachkraft(employees, assigned) == 0:
+        best_fk = find_best_block_start(
+            employees=employees,
+            day=day,
+            month=month,
+            year=year,
+            need_fachkraft_now=True,
+            days_in_month=days_in_month,
+        )
+        if best_fk is not None:
+            emp_idx, block_name, pattern = best_fk
+            lock_block(employees[emp_idx], day, pattern)
+            assigned = get_locked_workers_for_day(employees, day)
+            warnings.append(
+                f"Pflichtabdeckung {get_day_label(day, month, year)}: "
+                f"{employees[emp_idx].name} startet {block_name}-Block als notwendige Fachkraft."
+            )
+
+    while len(assigned) < req.minimum:
+        need_fk_now = count_fachkraft(employees, assigned) == 0
+        best = find_best_block_start(
+            employees=employees,
+            day=day,
+            month=month,
+            year=year,
+            need_fachkraft_now=need_fk_now,
+            days_in_month=days_in_month,
+        )
+
+        if best is None:
+            break
+
+        emp_idx, block_name, pattern = best
+        lock_block(employees[emp_idx], day, pattern)
+        assigned = get_locked_workers_for_day(employees, day)
+
+        warnings.append(
+            f"Pflichtabdeckung {get_day_label(day, month, year)}: "
+            f"{employees[emp_idx].name} startet {block_name}-Block."
+        )
+
+    if len(assigned) < req.minimum or count_fachkraft(employees, assigned) == 0:
+        assigned = fill_day_with_fallback_workers(
+            employees=employees,
+            day=day,
+            month=month,
+            year=year,
+            assigned=assigned,
+            warnings=warnings,
+            days_in_month=days_in_month,
+            target_override=req.minimum,
+        )
+
+    return get_locked_workers_for_day(employees, day)
 
 
 def update_states_for_day(employees: List[Employee], day: int, assigned_ids: List[int]) -> None:
@@ -585,28 +674,61 @@ def generate_schedule(
     year: int,
     days_in_month: int,
 ) -> Tuple[List[List[int]], List[str], List[Employee]]:
+    """
+    Prioritätslogik:
+
+    Phase A:
+      Alle Tage zuerst auf Mindestbesetzung bringen:
+      - mindestens 2 Personen
+      - mindestens 1 Fachkraft
+
+    Phase B:
+      Wochenenden (Fr/Sa/So) auf 3 Personen bringen
+
+    Phase C:
+      Wochentage optional von 2 auf 3 auffüllen
+    """
     employees = copy.deepcopy(employees_input)
-    assignments_by_day: List[List[int]] = [[] for _ in range(days_in_month)]
     warnings: List[str] = []
 
+    # Phase A: Mindestabdeckung
+    for day in range(1, days_in_month + 1):
+        assigned = ensure_minimum_coverage_for_day(
+            employees=employees,
+            day=day,
+            month=month,
+            year=year,
+            days_in_month=days_in_month,
+            warnings=warnings,
+        )
+
+        if len(assigned) < 2:
+            warnings.append(
+                f"Unterbesetzung {get_day_label(day, month, year)}: "
+                f"nur {len(assigned)} Person(en), mindestens 2 erforderlich."
+            )
+
+        if count_fachkraft(employees, assigned) == 0:
+            warnings.append(
+                f"Keine Fachkraft an {get_day_label(day, month, year)} eingeplant."
+            )
+
+    # Phase B: Wochenende auf 3
     for day in range(1, days_in_month + 1):
         req = requirement_for_day(day, month, year)
+        if not req.exact_target:
+            continue
 
         assigned = get_locked_workers_for_day(employees, day)
 
-        if len(assigned) > req.target:
-            warnings.append(
-                f"Überbesetzung {get_day_label(day, month, year)}: "
-                f"{len(assigned)} Personen reserviert, Ziel {req.target}."
-            )
-
         while len(assigned) < req.target:
-            need_fk_now = req.needs_fachkraft and count_fachkraft(employees, assigned) == 0
+            need_fk_now = count_fachkraft(employees, assigned) == 0
+
             best = find_best_block_start(
-                employees,
-                day,
-                month,
-                year,
+                employees=employees,
+                day=day,
+                month=month,
+                year=year,
                 need_fachkraft_now=need_fk_now,
                 days_in_month=days_in_month,
             )
@@ -619,38 +741,108 @@ def generate_schedule(
             assigned = get_locked_workers_for_day(employees, day)
 
             warnings.append(
-                f"Blockstart {get_day_label(day, month, year)}: "
+                f"Wochenendauffüllung {get_day_label(day, month, year)}: "
                 f"{employees[emp_idx].name} startet {block_name}-Block."
             )
 
-        if len(assigned) < req.target:
+        if len(assigned) < 3:
             assigned = fill_day_with_fallback_workers(
-                employees, day, month, year, assigned, warnings, days_in_month
+                employees=employees,
+                day=day,
+                month=month,
+                year=year,
+                assigned=assigned,
+                warnings=warnings,
+                days_in_month=days_in_month,
+                target_override=3,
             )
 
         assigned = get_locked_workers_for_day(employees, day)
+
+        if len(assigned) < 3:
+            warnings.append(
+                f"Wochenende unterbesetzt {get_day_label(day, month, year)}: "
+                f"{len(assigned)} statt 3."
+            )
+
+        if count_fachkraft(employees, assigned) == 0:
+            warnings.append(
+                f"Keine Fachkraft am Wochenende {get_day_label(day, month, year)}."
+            )
+
+    # Phase C: Wochentage optional auf 3
+    for day in range(1, days_in_month + 1):
+        req = requirement_for_day(day, month, year)
+        if req.exact_target:
+            continue
+
+        assigned = get_locked_workers_for_day(employees, day)
+
+        while len(assigned) < req.target:
+            need_fk_now = count_fachkraft(employees, assigned) == 0
+
+            best = find_best_block_start(
+                employees=employees,
+                day=day,
+                month=month,
+                year=year,
+                need_fachkraft_now=need_fk_now,
+                days_in_month=days_in_month,
+            )
+
+            if best is None:
+                break
+
+            emp_idx, block_name, pattern = best
+            lock_block(employees[emp_idx], day, pattern)
+            assigned = get_locked_workers_for_day(employees, day)
+
+            warnings.append(
+                f"Wochentag-Auffüllung {get_day_label(day, month, year)}: "
+                f"{employees[emp_idx].name} startet {block_name}-Block."
+            )
+
+        if len(assigned) < 3:
+            assigned = fill_day_with_fallback_workers(
+                employees=employees,
+                day=day,
+                month=month,
+                year=year,
+                assigned=assigned,
+                warnings=warnings,
+                days_in_month=days_in_month,
+                target_override=3,
+            )
+
+    # Finalisierung
+    assignments_by_day: List[List[int]] = [[] for _ in range(days_in_month)]
+
+    for day in range(1, days_in_month + 1):
+        assigned = get_locked_workers_for_day(employees, day)
+        req = requirement_for_day(day, month, year)
 
         if len(assigned) > req.target:
             assigned = assigned[:req.target]
 
         assignments_by_day[day - 1] = assigned
+        update_states_for_day(employees, day, assigned)
 
         if len(assigned) < req.minimum:
             warnings.append(
-                f"Unterbesetzung {get_day_label(day, month, year)}: "
-                f"{len(assigned)} eingeplant, Minimum {req.minimum}."
+                f"Unterbesetzung final {get_day_label(day, month, year)}: "
+                f"{len(assigned)} statt mindestens {req.minimum}."
             )
 
-        if req.needs_fachkraft and count_fachkraft(employees, assigned) == 0:
-            warnings.append(f"Keine Fachkraft an {get_day_label(day, month, year)} eingeplant.")
+        if count_fachkraft(employees, assigned) == 0:
+            warnings.append(
+                f"Keine Fachkraft final an {get_day_label(day, month, year)}."
+            )
 
         if not req.exact_target and len(assigned) == req.minimum:
             warnings.append(
                 f"Wochentag nur Mindestbesetzung an {get_day_label(day, month, year)}: "
                 f"{len(assigned)} statt Ziel {req.target}."
             )
-
-        update_states_for_day(employees, day, assigned)
 
     for emp in employees:
         if emp.assigned_count < emp.min_services:
