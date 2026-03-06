@@ -121,17 +121,60 @@ def load_active_employees(sb):
         .order("id")
         .execute()
     )
-    rows = result.data or []
+    return result.data or []
 
-    unique_by_id = {}
-    for row in rows:
-        emp_id = row.get("id")
-        if emp_id is None:
-            continue
-        if emp_id not in unique_by_id:
-            unique_by_id[emp_id] = row
 
-    return list(unique_by_id.values())
+def load_inactive_employees(sb):
+    result = (
+        sb.table("employees_master")
+        .select("*")
+        .eq("active", False)
+        .order("name")
+        .order("id")
+        .execute()
+    )
+    return result.data or []
+
+
+def add_employee_master(sb, name: str):
+    existing = (
+        sb.table("employees_master")
+        .select("id, active")
+        .eq("name", name)
+        .limit(1)
+        .execute()
+    )
+
+    if existing.data:
+        return {"status": "exists", "row": existing.data[0]}
+
+    created = (
+        sb.table("employees_master")
+        .insert({
+            "name": name,
+            "active": True,
+        })
+        .execute()
+    )
+    return {"status": "created", "row": created.data[0] if created.data else None}
+
+
+def deactivate_employee_master(sb, employee_id: int):
+    return (
+        sb.table("employees_master")
+        .update({"active": False})
+        .eq("id", employee_id)
+        .execute()
+    )
+
+
+def reactivate_employee_master(sb, employee_id: int):
+    return (
+        sb.table("employees_master")
+        .update({"active": True})
+        .eq("id", employee_id)
+        .execute()
+    )
 
 
 def load_existing_input_for_employee(sb, planning_round_id: int, employee_id: int):
@@ -542,7 +585,7 @@ def generate_schedule(
 
         while len(assigned) < req.target:
             need_fk_now = req.needs_fachkraft and count_fachkraft(employees, assigned) == 0
-            best = find_best_block_start(employees, day, month, year, need_fk_now, days_in_month)
+            best = find_best_block_start(employees, day, month, year, need_fachkraft_now=need_fk_now, days_in_month=days_in_month)
 
             if best is None:
                 break
@@ -781,28 +824,13 @@ if existing_input:
         default_availability = [bool(x) for x in loaded_availability]
 
 with st.form("employee_form"):
-    is_fachkraft = st.checkbox(
-        "Fachkraft",
-        value=default_is_fachkraft,
-    )
+    is_fachkraft = st.checkbox("Fachkraft", value=default_is_fachkraft)
 
     c1, c2 = st.columns(2)
     with c1:
-        min_services = st.number_input(
-            "Min-Dienste",
-            min_value=0,
-            max_value=31,
-            value=default_min_services,
-            step=1,
-        )
+        min_services = st.number_input("Min-Dienste", min_value=0, max_value=31, value=default_min_services, step=1)
     with c2:
-        max_services = st.number_input(
-            "Max-Dienste",
-            min_value=0,
-            max_value=31,
-            value=default_max_services,
-            step=1,
-        )
+        max_services = st.number_input("Max-Dienste", min_value=0, max_value=31, value=default_max_services, step=1)
 
     block_preferences = st.multiselect(
         "Bevorzugte Blockgrößen",
@@ -810,10 +838,7 @@ with st.form("employee_form"):
         default=default_blocks,
     )
 
-    wants_8_block = st.checkbox(
-        "8er-Block-Wunsch (4 + frei + 4)",
-        value=default_wants_8,
-    )
+    wants_8_block = st.checkbox("8er-Block-Wunsch (4 + frei + 4)", value=default_wants_8)
 
     st.write("Verfügbarkeit")
     availability = []
@@ -869,6 +894,73 @@ st.subheader("Admin-Bereich")
 admin_mode = st.checkbox("Admin-Modus aktivieren")
 
 if admin_mode:
+    active_employees = load_active_employees(sb)
+    inactive_employees = load_inactive_employees(sb)
+
+    st.markdown("### Mitarbeiter verwalten")
+
+    with st.form("add_employee_form"):
+        new_employee_name = st.text_input("Neuen Mitarbeiter hinzufügen")
+        add_submitted = st.form_submit_button("Mitarbeiter anlegen")
+
+    if add_submitted:
+        clean_name = new_employee_name.strip()
+        if not clean_name:
+            st.error("Bitte einen Namen eingeben.")
+        else:
+            try:
+                result = add_employee_master(sb, clean_name)
+                if result["status"] == "created":
+                    st.success(f"Mitarbeiter **{clean_name}** wurde angelegt.")
+                    st.rerun()
+                else:
+                    if result["row"].get("active"):
+                        st.warning(f"Mitarbeiter **{clean_name}** existiert bereits.")
+                    else:
+                        st.warning(
+                            f"Mitarbeiter **{clean_name}** existiert bereits, ist aber deaktiviert. "
+                            f"Du kannst ihn unten wieder aktivieren."
+                        )
+            except Exception as e:
+                st.error("Mitarbeiter konnte nicht angelegt werden.")
+                st.exception(e)
+
+    if active_employees:
+        active_options = {emp["name"]: emp["id"] for emp in active_employees}
+        selected_remove_name = st.selectbox(
+            "Aktiven Mitarbeiter deaktivieren",
+            options=list(active_options.keys()),
+            key="remove_employee_select",
+        )
+
+        if st.button("Mitarbeiter deaktivieren"):
+            try:
+                deactivate_employee_master(sb, active_options[selected_remove_name])
+                st.success(f"Mitarbeiter **{selected_remove_name}** wurde deaktiviert.")
+                st.rerun()
+            except Exception as e:
+                st.error("Mitarbeiter konnte nicht deaktiviert werden.")
+                st.exception(e)
+
+    if inactive_employees:
+        inactive_options = {emp["name"]: emp["id"] for emp in inactive_employees}
+        selected_reactivate_name = st.selectbox(
+            "Deaktivierten Mitarbeiter wieder aktivieren",
+            options=list(inactive_options.keys()),
+            key="reactivate_employee_select",
+        )
+
+        if st.button("Mitarbeiter reaktivieren"):
+            try:
+                reactivate_employee_master(sb, inactive_options[selected_reactivate_name])
+                st.success(f"Mitarbeiter **{selected_reactivate_name}** wurde reaktiviert.")
+                st.rerun()
+            except Exception as e:
+                st.error("Mitarbeiter konnte nicht reaktiviert werden.")
+                st.exception(e)
+
+    st.markdown("---")
+
     employees_for_plan = build_employees_from_inputs(sb, planning_round_id, days_in_month)
 
     st.write(f"Eingetragene Mitarbeitende für Planung: **{len(employees_for_plan)}**")
