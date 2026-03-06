@@ -147,16 +147,28 @@ if not employees_master:
     st.error("Keine Mitarbeitenden für diese Planungsrunde in der Tabelle 'employees' gefunden.")
     st.stop()
 
-st.subheader("Bereits eingegangene Mitarbeitereingaben")
+st.subheader("Status der Mitarbeitereingaben")
 rows = load_employee_inputs(sb, planning_round_id)
 
-if rows:
-    for row in rows:
-        updated_at = row.get("updated_at", "")
-        submitted_text = "Ja" if row.get("submitted") else "Nein"
-        st.write(f"**{row['name']}** — eingetragen: {submitted_text} — zuletzt geändert: {updated_at}")
-else:
-    st.info("Noch keine Mitarbeitereingaben vorhanden.")
+submitted_by_name = {
+    row["name"]: row
+    for row in rows
+    if row.get("submitted")
+}
+
+total_count = len(employees_master)
+submitted_count = len(submitted_by_name)
+missing_count = total_count - submitted_count
+
+st.info(f"{submitted_count} von {total_count} Mitarbeitenden haben bereits eingetragen.")
+
+for emp in employees_master:
+    name = emp["name"]
+    if name in submitted_by_name:
+        updated_at = submitted_by_name[name].get("updated_at", "")
+        st.write(f"✅ **{name}** — eingetragen — zuletzt geändert: {updated_at}")
+    else:
+        st.write(f"❌ **{name}** — noch offen")
 
 st.markdown("---")
 st.subheader("Eigene Daten eintragen")
