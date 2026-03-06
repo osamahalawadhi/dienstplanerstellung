@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import copy
 import io
 from dataclasses import dataclass, field
@@ -12,42 +13,69 @@ from openpyxl.styles import PatternFill, Alignment, Font
 from openpyxl.utils import get_column_letter
 
 
-# =========================
-# Konfiguration / Styling
-# =========================
-
 GREEN_FILL = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
 
 
-# =========================
+# =========================================================
+# Hilfsfunktionen Datum / Monat
+# =========================================================
+
+def get_days_in_month(month: int, year: int) -> int:
+    return calendar.monthrange(year, month)[1]
+
+
+def get_weekday_short(d: date) -> str:
+    weekday_map = {
+        0: "Mo",
+        1: "Di",
+        2: "Mi",
+        3: "Do",
+        4: "Fr",
+        5: "Sa",
+        6: "So",
+    }
+    return weekday_map[d.weekday()]
+
+
+def get_day_label(day: int, month: int, year: int) -> str:
+    d = date(year, month, day)
+    return f"{get_weekday_short(d)} {d.strftime('%d.%m.%Y')}"
+
+
+def get_excel_day_label(day: int, month: int, year: int) -> str:
+    d = date(year, month, day)
+    return f"{get_weekday_short(d)}\n{d.strftime('%d.%m.%Y')}"
+
+
+# =========================================================
 # Datenmodelle
-# =========================
+# =========================================================
 
 @dataclass
 class Employee:
     name: str
     is_fachkraft: bool
-    availability: List[bool]  # Länge 31
+    availability: List[bool]
     min_services: int
     max_services: int
     block_preferences: Set[int]
     wants_8_block: bool
 
-    # Laufzeit-Status
     assigned_count: int = 0
     current_streak: int = 0
     last_day_assigned: Optional[int] = None
 
-    # Block-Reservierungen
-    locked_work_days: Set[int] = field(default_factory=set)  # 1..31
-    locked_free_days: Set[int] = field(default_factory=set)  # 1..31
+    locked_work_days: Set[int] = field(default_factory=set)
+    locked_free_days: Set[int] = field(default_factory=set)
 
-    def validate(self) -> List[str]:
+    def validate(self, days_in_month: int) -> List[str]:
         errors = []
         if not self.name.strip():
             errors.append("Name fehlt.")
-        if len(self.availability) != 31:
-            errors.append(f"{self.name or 'Mitarbeiter'}: Verfügbarkeit muss 31 Tage enthalten.")
+        if len(self.availability) != days_in_month:
+            errors.append(
+                f"{self.name or 'Mitarbeiter'}: Verfügbarkeit muss {days_in_month} Tage enthalten."
+            )
         if self.min_services < 0 or self.max_services < 0:
             errors.append(f"{self.name or 'Mitarbeiter'}: Min/Max-Dienste dürfen nicht negativ sein.")
         if self.max_services < self.min_services:
@@ -62,15 +90,15 @@ class DayRequirement:
     target: int
     minimum: int
     needs_fachkraft: bool = True
-    exact_target: bool = False  # Wochenende: exakt 3
+    exact_target: bool = False
 
 
-# =========================
-# Grundregeln
-# =========================
+# =========================================================
+# Fachlogik Regeln
+# =========================================================
 
 def requirement_for_day(day: int, month: int, year: int) -> DayRequirement:
-    wd = date(year, month, day).weekday()  # Montag=0 ... Sonntag=6
+    wd = date(year, month, day).weekday()
     if wd >= 4:  # Freitag, Samstag, Sonntag
         return DayRequirement(target=3, minimum=3, needs_fachkraft=True, exact_target=True)
     return DayRequirement(target=3, minimum=2, needs_fachkraft=True, exact_target=False)
@@ -86,9 +114,9 @@ def get_locked_workers_for_day(employees: List[Employee], day: int) -> List[int]
 
 def get_block_patterns(emp: Employee) -> List[Tuple[str, List[str]]]:
     """
-    Rückgabe in Prioritätsreihenfolge.
-    Größere Wunschblöcke zuerst.
-    8er-Wunsch wird als 4 + frei + 4 modelliert.
+    Priorität:
+    - 8er zuerst, wenn gewünscht
+    - danach größere Blöcke zuerst
     """
     patterns: List[Tuple[str, List[str]]] = []
 
@@ -101,17 +129,17 @@ def get_block_patterns(emp: Employee) -> List[Tuple[str, List[str]]]:
     return patterns
 
 
-def can_start_block(emp: Employee, start_day: int, pattern: List[str]) -> bool:
+def can_start_block(emp: Employee, start_day: int, pattern: List[str], days_in_month: int) -> bool:
     """
-    Prüft nur mit Blick auf den Mitarbeiter selbst:
+    Prüft Mitarbeiter-regeln:
     - passt in den Monat
-    - verfügbar an allen Arbeitstagen
-    - kollidiert nicht mit reservierten Frei-/Arbeitstagen
-    - verletzt nicht die 4er-Regel
-    - überschreitet max Dienste nicht
+    - Verfügbarkeit an Arbeitstagen
+    - keine Kollision mit locked work/free
+    - 4er-Regel
+    - Max-Dienste
     """
     end_day = start_day + len(pattern) - 1
-    if end_day > 31:
+    if end_day > days_in_month:
         return False
 
     work_days_needed = 0
@@ -120,8 +148,6 @@ def can_start_block(emp: Employee, start_day: int, pattern: List[str]) -> bool:
     streak = emp.current_streak
     previous_day = start_day - 1
 
-    # Wenn direkt an bestehende Reservierung anschließt, Streak simulieren.
-    # Falls der Vortag nicht der letzte echte Dienst war, starten wir neu.
     if emp.last_day_assigned != previous_day and previous_day not in emp.locked_work_days:
         streak = 0
 
@@ -162,9 +188,8 @@ def block_respects_future_capacity(
     emp_idx: int,
 ) -> bool:
     """
-    Prüft, ob das Reservieren dieses Blocks an irgendeinem betroffenen Arbeitstag
-    die Tageskapazität überschreiten würde.
-    Obergrenze hier: 3 pro Tag.
+    Kein Tag soll durch den neuen Block über Zielbesetzung hinausgehen.
+    Obergrenze = 3.
     """
     for offset, token in enumerate(pattern):
         if token != "work":
@@ -191,31 +216,21 @@ def lock_block(emp: Employee, start_day: int, pattern: List[str]) -> None:
 
 
 def employee_priority_score(emp: Employee, block_name: str, pattern: List[str], day: int) -> int:
-    """
-    Bewertet mögliche Blockstarts.
-    Hoher Score = besser.
-    """
     score = 0
 
-    # Größere echte Arbeitsblöcke bevorzugen
     score += pattern.count("work") * 10
 
-    # 8er-Wunsch sehr hoch priorisieren, wenn möglich
     if block_name == "8er":
         score += 40
 
-    # Mitarbeitende unter Min-Diensten bevorzugen
     if len(emp.locked_work_days) < emp.min_services:
         score += 20
 
-    # Fairness: weniger bisher geplante Tage = mehr Bonus
     score += max(0, 30 - len(emp.locked_work_days) * 2)
 
-    # Fachkräfte leicht bevorzugen
     if emp.is_fachkraft:
         score += 5
 
-    # Wenn ein Block genau heute weitergeführt wird, leicht bevorzugen
     if (day - 1) in emp.locked_work_days:
         score += 8
 
@@ -228,20 +243,16 @@ def find_best_block_start(
     month: int,
     year: int,
     need_fachkraft_now: bool,
+    days_in_month: int,
 ) -> Optional[Tuple[int, str, List[str]]]:
-    """
-    Sucht den besten Mitarbeiter + Block, der heute starten kann.
-    """
     candidates: List[Tuple[int, int, str, List[str]]] = []
 
     for i, emp in enumerate(employees):
         if day in emp.locked_work_days or day in emp.locked_free_days:
             continue
 
-        patterns = get_block_patterns(emp)
-
-        for block_name, pattern in patterns:
-            if not can_start_block(emp, day, pattern):
+        for block_name, pattern in get_block_patterns(emp):
+            if not can_start_block(emp, day, pattern, days_in_month):
                 continue
             if not block_respects_future_capacity(employees, day, pattern, month, year, i):
                 continue
@@ -271,10 +282,10 @@ def fill_day_with_fallback_workers(
     year: int,
     assigned: List[int],
     warnings: List[str],
+    days_in_month: int,
 ) -> List[int]:
     """
-    Falls an einem Tag trotz Blocklogik noch Plätze fehlen, wird mit 1er-Blocks aufgefüllt.
-    Auch das ist ein echter Block, nur Länge 1.
+    Falls keine Wunschblöcke mehr möglich sind, mit 1er-Blöcken auffüllen.
     """
     req = requirement_for_day(day, month, year)
 
@@ -289,7 +300,7 @@ def fill_day_with_fallback_workers(
                 continue
 
             pattern = ["work"]
-            if not can_start_block(emp, day, pattern):
+            if not can_start_block(emp, day, pattern, days_in_month):
                 continue
             if not block_respects_future_capacity(employees, day, pattern, month, year, i):
                 continue
@@ -317,8 +328,8 @@ def fill_day_with_fallback_workers(
         lock_block(employees[emp_idx], day, ["work"])
         assigned = get_locked_workers_for_day(employees, day)
         warnings.append(
-            f"Fallback an Tag {day}: {employees[emp_idx].name} wurde mit 1er-Block ergänzt, "
-            f"weil kein passender Wunschblock mehr möglich war."
+            f"Fallback an {get_day_label(day, month, year)}: {employees[emp_idx].name} "
+            f"wurde mit 1er-Block ergänzt, weil kein passender Wunschblock mehr möglich war."
         )
 
     return assigned
@@ -339,34 +350,30 @@ def update_states_for_day(employees: List[Employee], day: int, assigned_ids: Lis
             emp.current_streak = 0
 
 
-def generate_schedule(employees_input: List[Employee], month: int, year: int) -> Tuple[List[List[int]], List[str], List[Employee]]:
-    """
-    Gibt zurück:
-    - assignments_by_day
-    - warnings
-    - final_employees_state
-    """
+def generate_schedule(
+    employees_input: List[Employee],
+    month: int,
+    year: int,
+    days_in_month: int,
+) -> Tuple[List[List[int]], List[str], List[Employee]]:
     employees = copy.deepcopy(employees_input)
-    assignments_by_day: List[List[int]] = [[] for _ in range(31)]
+    assignments_by_day: List[List[int]] = [[] for _ in range(days_in_month)]
     warnings: List[str] = []
 
-    for day in range(1, 32):
+    for day in range(1, days_in_month + 1):
         req = requirement_for_day(day, month, year)
 
-        # Bereits reservierte Arbeitstage
         assigned = get_locked_workers_for_day(employees, day)
 
-        # Falls schon zu viele reserviert wären, Warnung
         if len(assigned) > req.target:
             warnings.append(
-                f"Überbesetzung Tag {day}: {len(assigned)} Personen reserviert, Ziel {req.target}. "
-                f"Bitte Eingaben prüfen."
+                f"Überbesetzung {get_day_label(day, month, year)}: "
+                f"{len(assigned)} Personen reserviert, Ziel {req.target}."
             )
 
-        # Bis Zielbesetzung mit echten Wunschblöcken auffüllen
         while len(assigned) < req.target:
             need_fk_now = req.needs_fachkraft and count_fachkraft(employees, assigned) == 0
-            best = find_best_block_start(employees, day, month, year, need_fk_now)
+            best = find_best_block_start(employees, day, month, year, need_fk_now, days_in_month)
 
             if best is None:
                 break
@@ -376,38 +383,38 @@ def generate_schedule(employees_input: List[Employee], month: int, year: int) ->
             assigned = get_locked_workers_for_day(employees, day)
 
             warnings.append(
-                f"Blockstart Tag {day}: {employees[emp_idx].name} startet {block_name}-Block."
+                f"Blockstart {get_day_label(day, month, year)}: "
+                f"{employees[emp_idx].name} startet {block_name}-Block."
             )
 
-        # Falls Wunschblöcke nicht reichen: mit 1er-Blöcken ergänzen
         if len(assigned) < req.target:
-            assigned = fill_day_with_fallback_workers(employees, day, month, year, assigned, warnings)
+            assigned = fill_day_with_fallback_workers(
+                employees, day, month, year, assigned, warnings, days_in_month
+            )
 
-        # Final für diesen Tag
         assigned = get_locked_workers_for_day(employees, day)
 
-        # Sicherheit: nicht mehr als 3 ausgeben
         if len(assigned) > req.target:
             assigned = assigned[:req.target]
 
         assignments_by_day[day - 1] = assigned
 
-        # Tageswarnungen
         if len(assigned) < req.minimum:
             warnings.append(
-                f"Unterbesetzung Tag {day}: {len(assigned)} eingeplant, Minimum {req.minimum}."
+                f"Unterbesetzung {get_day_label(day, month, year)}: "
+                f"{len(assigned)} eingeplant, Minimum {req.minimum}."
             )
 
         if req.needs_fachkraft and count_fachkraft(employees, assigned) == 0:
-            warnings.append(f"Keine Fachkraft Tag {day} eingeplant.")
+            warnings.append(f"Keine Fachkraft an {get_day_label(day, month, year)} eingeplant.")
 
         update_states_for_day(employees, day, assigned)
 
-    # Monatsabschluss
     for emp in employees:
         if emp.assigned_count < emp.min_services:
             warnings.append(
-                f"Min-Dienste nicht erreicht: {emp.name} hat {emp.assigned_count}, Minimum {emp.min_services}."
+                f"Min-Dienste nicht erreicht: {emp.name} hat {emp.assigned_count}, "
+                f"Minimum {emp.min_services}."
             )
 
         if not emp.block_preferences and not emp.wants_8_block:
@@ -416,9 +423,9 @@ def generate_schedule(employees_input: List[Employee], month: int, year: int) ->
     return assignments_by_day, warnings, employees
 
 
-# =========================
+# =========================================================
 # Excel Export
-# =========================
+# =========================================================
 
 def build_excel(
     original_employees: List[Employee],
@@ -426,7 +433,8 @@ def build_excel(
     assignments_by_day: List[List[int]],
     warnings: List[str],
     month: int,
-    year: int
+    year: int,
+    days_in_month: int,
 ) -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -434,33 +442,33 @@ def build_excel(
 
     ws["A1"] = "Name"
     ws["A1"].font = Font(bold=True)
-    ws["A1"].alignment = Alignment(horizontal="center")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
 
-    for d in range(1, 32):
-        col = get_column_letter(1 + d)  # B..AF
-        ws[f"{col}1"] = d
+    for d in range(1, days_in_month + 1):
+        col = get_column_letter(1 + d)
+        ws[f"{col}1"] = get_excel_day_label(d, month, year)
         ws[f"{col}1"].font = Font(bold=True)
-        ws[f"{col}1"].alignment = Alignment(horizontal="center")
+        ws[f"{col}1"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    sum_col = get_column_letter(33)  # AG
+    sum_col = get_column_letter(days_in_month + 2)
     ws[f"{sum_col}1"] = "Summe"
     ws[f"{sum_col}1"].font = Font(bold=True)
-    ws[f"{sum_col}1"].alignment = Alignment(horizontal="center")
+    ws[f"{sum_col}1"].alignment = Alignment(horizontal="center", vertical="center")
 
     ws.column_dimensions["A"].width = 20
-    for d in range(1, 32):
-        ws.column_dimensions[get_column_letter(1 + d)].width = 5
+    for d in range(1, days_in_month + 1):
+        ws.column_dimensions[get_column_letter(1 + d)].width = 12
     ws.column_dimensions[sum_col].width = 10
+    ws.row_dimensions[1].height = 32
 
     assigned_sets = [set(day_ids) for day_ids in assignments_by_day]
 
     for row_idx, emp in enumerate(original_employees, start=2):
         ws[f"A{row_idx}"] = emp.name
-
-        service_count = 0
         emp_idx = row_idx - 2
+        service_count = 0
 
-        for day_idx0 in range(31):
+        for day_idx0 in range(days_in_month):
             col = get_column_letter(2 + day_idx0)
             cell = ws[f"{col}{row_idx}"]
             cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -473,12 +481,12 @@ def build_excel(
                 cell.value = ""
 
         ws[f"{sum_col}{row_idx}"] = service_count
-        ws[f"{sum_col}{row_idx}"].alignment = Alignment(horizontal="center")
+        ws[f"{sum_col}{row_idx}"].alignment = Alignment(horizontal="center", vertical="center")
 
     ws2 = wb.create_sheet("Warnungen")
     ws2["A1"] = "Warnungen"
     ws2["A1"].font = Font(bold=True)
-    ws2.column_dimensions["A"].width = 120
+    ws2.column_dimensions["A"].width = 140
 
     for i, warning in enumerate(warnings, start=2):
         ws2[f"A{i}"] = warning
@@ -504,12 +512,12 @@ def build_excel(
     return buffer.getvalue()
 
 
-# =========================
+# =========================================================
 # UI Hilfsfunktionen
-# =========================
+# =========================================================
 
-def employee_from_form(prefix: str) -> Employee:
-    availability = [st.session_state.get(f"{prefix}_day_{d}", False) for d in range(1, 32)]
+def employee_from_form(prefix: str, days_in_month: int) -> Employee:
+    availability = [st.session_state.get(f"{prefix}_day_{d}", False) for d in range(1, days_in_month + 1)]
 
     return Employee(
         name=st.session_state.get(f"{prefix}_name", "").strip(),
@@ -522,10 +530,7 @@ def employee_from_form(prefix: str) -> Employee:
     )
 
 
-def preset_employee(prefix: str, index: int) -> None:
-    if st.session_state.get(f"{prefix}_name"):
-        return
-
+def preset_employee(prefix: str, index: int, days_in_month: int) -> None:
     example_names = [
         "Anna", "Ben", "Clara", "David", "Elif", "Farid",
         "Greta", "Hasan", "Iris", "Jonas", "Klara", "Luca"
@@ -538,17 +543,31 @@ def preset_employee(prefix: str, index: int) -> None:
     st.session_state[f"{prefix}_max"] = 15
     st.session_state[f"{prefix}_blocks"] = [2]
     st.session_state[f"{prefix}_wants8"] = False
-    for d in range(1, 32):
+
+    for d in range(1, days_in_month + 1):
         st.session_state[f"{prefix}_day_{d}"] = True
 
 
-# =========================
+def cleanup_day_keys_for_shorter_month(employee_count: int, days_in_month: int) -> None:
+    """
+    Wenn Monat kürzer ist, bleiben alte Session-Keys sonst erhalten.
+    Das ist nicht kritisch, aber wir räumen auf.
+    """
+    for i in range(employee_count):
+        prefix = f"emp_{i}"
+        for d in range(days_in_month + 1, 32):
+            key = f"{prefix}_day_{d}"
+            if key in st.session_state:
+                del st.session_state[key]
+
+
+# =========================================================
 # Streamlit App
-# =========================
+# =========================================================
 
 st.set_page_config(page_title="Dienstplaner Nachtwache", layout="wide")
 st.title("Dienstplaner Nachtwache")
-st.caption("Blockbasierte Planung mit Pflicht-Berücksichtigung von Blockwünschen und 8er-Muster (4 + frei + 4).")
+st.caption("Blockbasierte Planung mit echten Datumsangaben und variabler Monatslänge.")
 
 if "employee_count" not in st.session_state:
     st.session_state.employee_count = 4
@@ -558,7 +577,11 @@ with st.sidebar:
     month = st.number_input("Monat", min_value=1, max_value=12, value=3, step=1)
     year = st.number_input("Jahr", min_value=2025, max_value=2100, value=2026, step=1)
 
+    days_in_month = get_days_in_month(int(month), int(year))
+    st.info(f"Monat hat {days_in_month} Tage.")
+
     st.markdown("---")
+
     if st.button("Mitarbeiter hinzufügen"):
         st.session_state.employee_count += 1
 
@@ -569,16 +592,18 @@ with st.sidebar:
         count = max(st.session_state.employee_count, 6)
         st.session_state.employee_count = count
         for i in range(count):
-            preset_employee(f"emp_{i}", i)
+            preset_employee(f"emp_{i}", i, days_in_month)
         st.success("Beispieldaten geladen.")
+
+cleanup_day_keys_for_shorter_month(st.session_state.employee_count, days_in_month)
 
 st.subheader("Mitarbeiterdaten")
 
 for i in range(st.session_state.employee_count):
     prefix = f"emp_{i}"
+
     with st.expander(f"Mitarbeiter {i + 1}", expanded=(i < 2)):
         col1, col2 = st.columns([2, 1])
-
         with col1:
             st.text_input("Name", key=f"{prefix}_name")
         with col2:
@@ -595,7 +620,7 @@ for i in range(st.session_state.employee_count):
             options=[1, 2, 3, 4],
             default=[2],
             key=f"{prefix}_blocks",
-            help="Mindestens eine Blockgröße auswählen oder 8er-Wunsch aktivieren."
+            help="Mindestens eine Blockgröße auswählen oder 8er-Wunsch aktivieren.",
         )
 
         st.checkbox(
@@ -603,26 +628,29 @@ for i in range(st.session_state.employee_count):
             key=f"{prefix}_wants8",
         )
 
-        st.write("Verfügbarkeit (Tag 1 bis 31)")
+        st.write("Verfügbarkeit")
         cols = st.columns(7)
-        for d in range(1, 32):
+        for d in range(1, days_in_month + 1):
+            label = get_day_label(d, int(month), int(year))
             with cols[(d - 1) % 7]:
-                st.checkbox(f"Tag {d}", value=True, key=f"{prefix}_day_{d}")
+                st.checkbox(label, value=True, key=f"{prefix}_day_{d}")
 
 st.markdown("---")
 
 if st.button("Dienstplan erstellen", type="primary"):
-    employees = [employee_from_form(f"emp_{i}") for i in range(st.session_state.employee_count)]
+    employees = [employee_from_form(f"emp_{i}", days_in_month) for i in range(st.session_state.employee_count)]
 
     errors: List[str] = []
     for emp in employees:
-        errors.extend(emp.validate())
+        errors.extend(emp.validate(days_in_month))
 
     if errors:
         for err in errors:
             st.error(err)
     else:
-        assignments_by_day, warnings, final_employees = generate_schedule(employees, int(month), int(year))
+        assignments_by_day, warnings, final_employees = generate_schedule(
+            employees, int(month), int(year), days_in_month
+        )
 
         excel_bytes = build_excel(
             original_employees=employees,
@@ -631,6 +659,7 @@ if st.button("Dienstplan erstellen", type="primary"):
             warnings=warnings,
             month=int(month),
             year=int(year),
+            days_in_month=days_in_month,
         )
 
         st.success("Dienstplan wurde erstellt.")
