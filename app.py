@@ -452,85 +452,68 @@ def _build_model(
             fk_missing.append(None)
 
     # ── Objective ────────────────────────────────────────────────────────
-    # Basis-Strafe (immer): Unterbesetzung und fehlende Fachkraft
-    # Strategie beeinflusst zusätzliche Gewichtungen um echte
-    # unterschiedliche Lösungen zu erzwingen.
+    # Kernprinzip:
+    # 1. Unterbesetzung kostet -10000 pro fehlender Person (höchste Priorität)
+    # 2. Fehlende Fachkraft kostet -5000
+    # 3. Jeder zusätzliche Dienst (über Min bis Max) wird belohnt WENN er
+    #    einen unterbesetzten Tag füllt → Solver nutzt Min-Max-Spielraum aktiv
+    # 4. Strategie-spezifische Feinsteuerung der Verteilung
     #
-    # strategy=1: Gleichmäßige Verteilung – bevorzuge Mitarbeiter mit wenig Diensten
-    # strategy=2: Schwierige Tage zuerst – höhere Belohnung für Tage mit wenig Verfügbarkeit
-    # strategy=3: Fachkraft & Wochenende zuerst – maximiere FK-Abdeckung und Wochenendbesetzung
+    # Min/Max bleiben HARTE Constraints – der Objective darf sie nie verletzen.
+    # Aber innerhalb [min, max] wählt der Solver aktiv die beste Anzahl.
     objective_terms = []
 
-    # ── Basis: Strafe für Unterbesetzung (alle Strategien gleich) ─────────
+    # ── Priorität 1: Unterbesetzung stark bestrafen ───────────────────────
     for sf in shortfall_day:
-        objective_terms.append(-1000 * sf)
+        objective_terms.append(-10000 * sf)
 
+    # ── Priorität 2: Fehlende Fachkraft bestrafen ────────────────────────
     for fkm in fk_missing:
         if fkm is not None:
-            objective_terms.append(-1000 * fkm)
+            objective_terms.append(-5000 * fkm)
 
-    # ── Strategie-spezifische Gewichtungen ────────────────────────────────
+    # ── Priorität 3: Tagesbesetzung maximieren (bis 3) ───────────────────
+    # Jeder Dienst an einem unterbesetzten Tag ist wertvoll.
+    # Gewichtung: Tage mit wenig Verfügbarkeit = höhere Belohnung
+    for d in range(D):
+        req = requirement_for_day(d + 1, month, year)
+        available_count = sum(1 for emp in employees if emp.availability[d])
+        # Scarcity: je weniger verfügbar, desto wertvoller jede Zuweisung
+        scarcity = max(1, n - available_count + 1)
+        weekend_bonus = 3 if req.exact_target else 1
+        daily_total = sum(shift[e][d] for e in range(n))
+        objective_terms.append(scarcity * weekend_bonus * 100 * daily_total)
+
+    # ── Priorität 4: Strategie-spezifische Feinsteuerung ─────────────────
     if strategy == 1:
         # Gleichmäßige Verteilung:
-        # Belohne Zuweisung an Mitarbeiter die noch wenig haben (relativ zu ihrem Min)
-        # → verteilt Dienste fairer über alle Mitarbeiter
-        for d in range(D):
-            for e, emp in enumerate(employees):
-                # Je weiter unter dem Min, desto mehr Belohnung für diesen Tag
-                gap = max(0, emp.min_services - 1)  # Proxy für "braucht noch Dienste"
-                objective_terms.append((1 + gap) * shift[e][d])
-
-        # Zusätzlich: bestrafe große Ungleichheit (Varianz-Proxy)
-        # Mitarbeiter die über ihrem Durchschnitt sind, bekommen weniger Belohnung
-        avg_min = sum(emp.min_services for emp in employees) // max(1, n)
+        # Mitarbeiter die noch Spielraum nach oben haben bevorzugen
         for e, emp in enumerate(employees):
             total = sum(shift[e][d] for d in range(D))
-            if emp.min_services > avg_min:
-                objective_terms.append(-2 * total)
+            # Belohne bis zum Mittelpunkt von [min, max]
+            midpoint = (emp.min_services + emp.max_services) // 2
+            room = max(0, midpoint - emp.min_services)
+            if room > 0:
+                objective_terms.append(room * total)
 
     elif strategy == 2:
         # Schwierige Tage zuerst:
-        # Berechne für jeden Tag wie viele Mitarbeiter verfügbar sind
-        # Tage mit wenig Verfügbarkeit bekommen höhere Belohnung pro Person
+        # Zusätzlicher Bonus für kritische Tage (wenig Verfügbarkeit)
         for d in range(D):
             available_count = sum(1 for emp in employees if emp.availability[d])
-            # Je weniger verfügbar, desto wertvoller ist jede Zuweisung
-            scarcity_weight = max(1, n - available_count + 1)
-            daily_total = sum(shift[e][d] for e in range(n))
-            objective_terms.append(scarcity_weight * daily_total)
-
-        # Wochenenden extra priorisieren
-        for d in range(D):
-            req = requirement_for_day(d + 1, month, year)
-            if req.exact_target:
+            if available_count <= 3:  # Kritischer Tag
                 daily_total = sum(shift[e][d] for e in range(n))
-                objective_terms.append(50 * daily_total)
+                objective_terms.append(500 * daily_total)
 
     elif strategy == 3:
         # Fachkraft & Wochenende maximieren:
-        # Fachkräfte bekommen viel höhere Belohnung → Solver setzt sie bevorzugt ein
-        # Wochenenden bekommen extra Gewicht
+        # Fachkräfte stark bevorzugen, Wochenenden extra gewichten
         for d in range(D):
             req = requirement_for_day(d + 1, month, year)
-            day_weight = 10 if req.exact_target else 3
-
             for e, emp in enumerate(employees):
-                fk_bonus = 20 if emp.is_fachkraft else 0
-                objective_terms.append((day_weight + fk_bonus) * shift[e][d])
-
-        # Zusätzlich: belohne jeden Tag an dem eine Fachkraft eingeplant ist
-        for fkm in fk_missing:
-            if fkm is not None:
-                # Belohnung wenn Fachkraft vorhanden (= fkm ist 0)
-                objective_terms.append(-50 * fkm)  # Strafe wenn keine FK
-
-    else:
-        # Fallback: einfache Maximierung der Gesamtbesetzung
-        for d in range(D):
-            req = requirement_for_day(d + 1, month, year)
-            if not req.exact_target:
-                daily_total = sum(shift[e][d] for e in range(n))
-                objective_terms.append(daily_total)
+                fk_bonus = 200 if emp.is_fachkraft else 0
+                we_bonus = 100 if req.exact_target else 0
+                objective_terms.append((fk_bonus + we_bonus) * shift[e][d])
 
     model.Maximize(sum(objective_terms))
     return model, shift
