@@ -1087,12 +1087,115 @@ if admin_mode:
             important_warnings = filter_user_warnings(warnings)
             st.success("Dienstplan wurde erstellt.")
 
-            st.download_button(
-                label="Dienstplan als Excel herunterladen",
-                data=schedule_excel,
-                file_name=f"dienstplan_{int(month):02d}_{int(year)}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            col_dl, col_prev = st.columns([1, 1])
+            with col_dl:
+                st.download_button(
+                    label="📥 Dienstplan als Excel herunterladen",
+                    data=schedule_excel,
+                    file_name=f"dienstplan_{int(month):02d}_{int(year)}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            # ── Vorschau im Browser ───────────────────────────────────────
+            st.markdown("### Vorschau Dienstplan")
+
+            assigned_sets = [set(ids) for ids in assignments_by_day]
+            fachkraft_set = {e for e, emp in enumerate(employees_for_plan) if emp.is_fachkraft}
+
+            # Build header row
+            day_labels = [get_day_label(d + 1, int(month), int(year)) for d in range(days_in_month)]
+
+            # Colour logic: highlight worked cells
+            # We render as an HTML table for full colour control
+            html_rows = []
+
+            # Header
+            th_days = "".join(
+                f'<th style="background:#2c3e50;color:white;padding:4px 6px;'
+                f'font-size:11px;white-space:pre-line;text-align:center;'
+                f'min-width:44px">{lbl.replace(" ", chr(10))}</th>'
+                for lbl in day_labels
             )
+            html_rows.append(
+                f'<tr>'
+                f'<th style="background:#2c3e50;color:white;padding:4px 8px;text-align:left;min-width:110px">Name</th>'
+                f'{th_days}'
+                f'<th style="background:#2c3e50;color:white;padding:4px 8px;text-align:center">Summe</th>'
+                f'</tr>'
+            )
+
+            # One row per employee
+            for e, emp in enumerate(employees_for_plan):
+                count = 0
+                cells = []
+                for d in range(days_in_month):
+                    if e in assigned_sets[d]:
+                        count += 1
+                        # Green for Fachkraft, lighter green for others
+                        bg = "#27ae60" if e in fachkraft_set else "#90EE90"
+                        fg = "white" if e in fachkraft_set else "#1a1a1a"
+                        cells.append(
+                            f'<td style="background:{bg};color:{fg};text-align:center;'
+                            f'padding:3px;font-weight:bold;font-size:12px">X</td>'
+                        )
+                    else:
+                        cells.append(
+                            '<td style="background:#f8f9fa;text-align:center;'
+                            'padding:3px;font-size:12px;color:#ccc">–</td>'
+                        )
+
+                fk_label = " ⭐" if emp.is_fachkraft else ""
+                name_cell = (
+                    f'<td style="padding:4px 8px;font-weight:bold;'
+                    f'white-space:nowrap;font-size:12px">{emp.name}{fk_label}</td>'
+                )
+                sum_cell = (
+                    f'<td style="text-align:center;font-weight:bold;padding:4px 8px;'
+                    f'background:#eaf4fb;font-size:12px">{count}</td>'
+                )
+                html_rows.append(f'<tr>{name_cell}{"".join(cells)}{sum_cell}</tr>')
+
+            # Summary row: how many per day
+            summary_cells = []
+            for d in range(days_in_month):
+                count_day = len(assigned_sets[d])
+                fk_day = sum(1 for e in assigned_sets[d] if e in fachkraft_set)
+                req = requirement_for_day(d + 1, int(month), int(year))
+                if count_day < req.minimum:
+                    bg = "#e74c3c"; fg = "white"   # red = understaff
+                elif fk_day == 0:
+                    bg = "#f39c12"; fg = "white"   # orange = no FK
+                else:
+                    bg = "#ecf0f1"; fg = "#2c3e50"  # neutral
+                summary_cells.append(
+                    f'<td style="background:{bg};color:{fg};text-align:center;'
+                    f'font-weight:bold;padding:3px;font-size:11px">{count_day}</td>'
+                )
+
+            html_rows.append(
+                f'<tr>'
+                f'<td style="padding:4px 8px;font-weight:bold;font-size:12px;'
+                f'background:#ecf0f1">Besetzt</td>'
+                f'{"".join(summary_cells)}'
+                f'<td style="background:#ecf0f1"></td>'
+                f'</tr>'
+            )
+
+            html_table = (
+                '<div style="overflow-x:auto;margin-top:8px">'
+                '<table style="border-collapse:collapse;width:100%;font-family:sans-serif">'
+                + "".join(html_rows)
+                + "</table></div>"
+                "<p style='font-size:11px;color:#888;margin-top:6px'>"
+                "⭐ = Fachkraft &nbsp;|&nbsp; "
+                "<span style='background:#27ae60;color:white;padding:1px 6px;border-radius:3px'>X</span> Fachkraft arbeitet &nbsp;|&nbsp; "
+                "<span style='background:#90EE90;padding:1px 6px;border-radius:3px'>X</span> Mitarbeiter arbeitet &nbsp;|&nbsp; "
+                "<span style='background:#e74c3c;color:white;padding:1px 6px;border-radius:3px'>Zahl</span> Unterbesetzt &nbsp;|&nbsp; "
+                "<span style='background:#f39c12;color:white;padding:1px 6px;border-radius:3px'>Zahl</span> Keine Fachkraft"
+                "</p>"
+            )
+
+            st.markdown(html_table, unsafe_allow_html=True)
 
             st.subheader("Warnungen")
             if important_warnings:
