@@ -236,60 +236,79 @@ def _build_model(
                 model.Add(shift[e][d] == 0)
 
     # ── Block structure ───────────────────────────────────────────────────
+    # Strategy:
+    #   - For each employee, create block_start[d,s] = 1 if a block of
+    #     size s starts on day d.
+    #   - Enforce: shift[e][d] == sum of all block_start vars that cover d
+    #     (exactly 1 active block covers each worked day, 0 for free days).
+    #   - Blocks must not overlap: enforced implicitly because shift[e][d]
+    #     can only be 0 or 1, and each worked day is covered by exactly 1.
+    #   - 8-blocks handled separately with their own indicator vars.
+
     for e, emp in enumerate(employees):
         allowed_sizes = set(emp.block_preferences)
 
-        block_start = {}
+        # block_start[(d,s)] = 1 means: employee e starts a block of
+        # size s on day d (0-indexed). Only created when block fits in month
+        # and all days in block are potentially available.
+        block_start: Dict[Tuple[int,int], object] = {}
         for d in range(D):
             for s in allowed_sizes:
                 if d + s <= D:
-                    block_start[(d, s)] = model.NewBoolVar(f"bs_e{e}_d{d}_s{s}")
+                    # Only create var if all days in block are available
+                    days_in_block = range(d, d + s)
+                    if all(emp.availability[dd] for dd in days_in_block):
+                        block_start[(d, s)] = model.NewBoolVar(f"bs_e{e}_d{d}_s{s}")
 
-        eight_block_vars = []
+        # 8-block vars: covers days d..d+3 (work), d+4 (free), d+5..d+8 (work)
+        eight_block_vars: List[Tuple[int, object]] = []
         if emp.wants_8_block:
             for d in range(D):
                 if d + 9 <= D:
-                    eight_block_vars.append((d, model.NewBoolVar(f"8blk_e{e}_d{d}")))
+                    work_days_8 = list(range(d, d+4)) + list(range(d+5, d+9))
+                    # Only if all work days are available
+                    if all(emp.availability[dd] for dd in work_days_8):
+                        eight_block_vars.append((d, model.NewBoolVar(f"8blk_e{e}_d{d}")))
 
+        # For each day: shift[e][d] == sum of all block vars covering that day
+        # Since shift is Bool (0 or 1), this means exactly 0 or 1 block covers it.
         for d in range(D):
             covering = []
 
+            # Normal blocks covering day d
             for s in allowed_sizes:
                 for start in range(max(0, d - s + 1), d + 1):
                     if (start, s) in block_start and start + s > d:
                         covering.append(block_start[(start, s)])
 
-            if emp.wants_8_block:
-                for (bd, bvar) in eight_block_vars:
-                    work_days_in_8 = list(range(bd, bd + 4)) + list(range(bd + 5, bd + 9))
-                    if d in work_days_in_8:
-                        covering.append(bvar)
+            # 8-blocks covering day d (only work days count)
+            for (bd, bvar) in eight_block_vars:
+                work_days_in_8 = list(range(bd, bd+4)) + list(range(bd+5, bd+9))
+                if d in work_days_in_8:
+                    covering.append(bvar)
 
             if covering:
-                model.AddBoolOr(covering).OnlyEnforceIf(shift[e][d])
-                model.AddBoolAnd([v.Not() for v in covering]).OnlyEnforceIf(shift[e][d].Not())
+                # shift[e][d] = 1 iff exactly one covering block is active
+                # Using linear equality: shift[e][d] == sum(covering)
+                # (sum can only be 0 or 1 since blocks must not overlap)
+                model.Add(shift[e][d] == sum(covering))
             else:
+                # No valid block can cover this day
                 model.Add(shift[e][d] == 0)
 
-        # 8-block internal constraints
-        if emp.wants_8_block:
-            for (bd, bvar) in eight_block_vars:
-                work_days = list(range(bd, bd + 4)) + list(range(bd + 5, bd + 9))
-                free_day = bd + 4
-                for wd in work_days:
-                    model.Add(shift[e][wd] == 1).OnlyEnforceIf(bvar)
-                model.Add(shift[e][free_day] == 0).OnlyEnforceIf(bvar)
-                for wd in work_days:
-                    if not emp.availability[wd]:
-                        model.Add(bvar == 0)
-                        break
+        # 8-block: enforce free day and that work days are linked to shift
+        for (bd, bvar) in eight_block_vars:
+            free_day = bd + 4
+            # Free day must be 0 when 8-block active
+            model.Add(shift[e][free_day] == 0).OnlyEnforceIf(bvar)
 
-        for d in range(D):
-            starters = [v for (dd, s), v in block_start.items() if dd == d]
-            if emp.wants_8_block:
-                starters += [bvar for (bd, bvar) in eight_block_vars if bd == d]
-            if len(starters) > 1:
-                model.Add(sum(starters) <= 1)
+        # Blocks of same size cannot overlap:
+        # Two blocks of size s starting at d1 and d2 overlap if |d1-d2| < s
+        # Enforced implicitly: since shift[e][d] = sum(covering) and shift <= 1,
+        # at most one block can cover any given day → no overlaps possible.
+
+        # Additionally: a normal block and an 8-block cannot both cover the same day
+        # Also enforced by the shift == sum(covering) constraint above.
 
     # ── Max 4 consecutive work days ───────────────────────────────────────
     for e in range(n):
