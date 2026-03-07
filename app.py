@@ -351,6 +351,10 @@ def _build_model(
         model.Add(total >= emp.min_services)
         model.Add(total <= emp.max_services)
 
+    # ── Max 3 workers per day (hard) ─────────────────────────────────────
+    for d in range(D):
+        model.Add(sum(shift[e][d] for e in range(n)) <= 3)
+
     # ── Daily coverage: SOFT via penalty variables ────────────────────────
     # We never make coverage a hard constraint.
     # Instead we penalise shortfalls heavily in the objective so the solver
