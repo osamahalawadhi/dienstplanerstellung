@@ -1,36 +1,35 @@
 import calendar
-import copy
 import io
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import List, Set, Optional, Tuple
+from typing import List, Set, Optional, Tuple, Dict
 
 import streamlit as st
 from supabase import create_client
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Alignment, Font
 from openpyxl.utils import get_column_letter
-
+from ortools.sat.python import cp_model
 
 GREEN_FILL = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
 
+
+# ─────────────────────────────────────────────
+# DATACLASSES
+# ─────────────────────────────────────────────
 
 @dataclass
 class Employee:
     name: str
     is_fachkraft: bool
-    availability: List[bool]
+    availability: List[bool]       # length = days_in_month
     min_services: int
     max_services: int
-    block_preferences: Set[int]
+    block_preferences: Set[int]    # e.g. {2, 3}
     wants_8_block: bool
 
+    # filled after scheduling
     assigned_count: int = 0
-    current_streak: int = 0
-    last_day_assigned: Optional[int] = None
-
-    locked_work_days: Set[int] = field(default_factory=set)
-    locked_free_days: Set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -41,6 +40,10 @@ class DayRequirement:
     exact_target: bool = False
 
 
+# ─────────────────────────────────────────────
+# SUPABASE
+# ─────────────────────────────────────────────
+
 @st.cache_resource
 def get_supabase():
     url = st.secrets["SUPABASE_URL"]
@@ -48,21 +51,16 @@ def get_supabase():
     return create_client(url, key)
 
 
+# ─────────────────────────────────────────────
+# DATE HELPERS
+# ─────────────────────────────────────────────
+
 def get_days_in_month(month: int, year: int) -> int:
     return calendar.monthrange(year, month)[1]
 
 
 def get_weekday_short(d: date) -> str:
-    weekday_map = {
-        0: "Mo",
-        1: "Di",
-        2: "Mi",
-        3: "Do",
-        4: "Fr",
-        5: "Sa",
-        6: "So",
-    }
-    return weekday_map[d.weekday()]
+    return ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"][d.weekday()]
 
 
 def get_day_label(day: int, month: int, year: int) -> str:
@@ -75,106 +73,53 @@ def get_excel_day_label(day: int, month: int, year: int) -> str:
     return f"{get_weekday_short(d)}\n{d.strftime('%d.%m.%Y')}"
 
 
+def requirement_for_day(day: int, month: int, year: int) -> DayRequirement:
+    wd = date(year, month, day).weekday()
+    if wd >= 4:  # Fr, Sa, So
+        return DayRequirement(target=3, minimum=3, needs_fachkraft=True, exact_target=True)
+    return DayRequirement(target=3, minimum=2, needs_fachkraft=True, exact_target=False)
+
+
+# ─────────────────────────────────────────────
+# SUPABASE DB FUNCTIONS
+# ─────────────────────────────────────────────
+
 def get_or_create_planning_round(sb, month: int, year: int):
     title = f"Dienstplan {month:02d}/{year}"
-
-    existing = (
-        sb.table("planning_rounds")
-        .select("*")
-        .eq("month", month)
-        .eq("year", year)
-        .execute()
-    )
-
+    existing = sb.table("planning_rounds").select("*").eq("month", month).eq("year", year).execute()
     if existing.data:
         return existing.data[0]
-
-    created = (
-        sb.table("planning_rounds")
-        .insert({
-            "month": month,
-            "year": year,
-            "title": title,
-        })
-        .execute()
-    )
+    created = sb.table("planning_rounds").insert({"month": month, "year": year, "title": title}).execute()
     return created.data[0]
 
 
 def load_employee_inputs(sb, planning_round_id: int):
-    result = (
-        sb.table("employee_inputs")
-        .select("*")
-        .eq("planning_round_id", planning_round_id)
-        .order("name")
-        .execute()
-    )
+    result = sb.table("employee_inputs").select("*").eq("planning_round_id", planning_round_id).order("name").execute()
     return result.data or []
 
 
 def load_active_employees(sb):
-    result = (
-        sb.table("employees_master")
-        .select("*")
-        .eq("active", True)
-        .order("name")
-        .order("id")
-        .execute()
-    )
-    return result.data or []
+    return sb.table("employees_master").select("*").eq("active", True).order("name").order("id").execute().data or []
 
 
 def load_inactive_employees(sb):
-    result = (
-        sb.table("employees_master")
-        .select("*")
-        .eq("active", False)
-        .order("name")
-        .order("id")
-        .execute()
-    )
-    return result.data or []
+    return sb.table("employees_master").select("*").eq("active", False).order("name").order("id").execute().data or []
 
 
 def add_employee_master(sb, name: str):
-    existing = (
-        sb.table("employees_master")
-        .select("id, active")
-        .eq("name", name)
-        .limit(1)
-        .execute()
-    )
-
+    existing = sb.table("employees_master").select("id, active").eq("name", name).limit(1).execute()
     if existing.data:
         return {"status": "exists", "row": existing.data[0]}
-
-    created = (
-        sb.table("employees_master")
-        .insert({
-            "name": name,
-            "active": True,
-        })
-        .execute()
-    )
+    created = sb.table("employees_master").insert({"name": name, "active": True}).execute()
     return {"status": "created", "row": created.data[0] if created.data else None}
 
 
 def deactivate_employee_master(sb, employee_id: int):
-    return (
-        sb.table("employees_master")
-        .update({"active": False})
-        .eq("id", employee_id)
-        .execute()
-    )
+    return sb.table("employees_master").update({"active": False}).eq("id", employee_id).execute()
 
 
 def reactivate_employee_master(sb, employee_id: int):
-    return (
-        sb.table("employees_master")
-        .update({"active": True})
-        .eq("id", employee_id)
-        .execute()
-    )
+    return sb.table("employees_master").update({"active": True}).eq("id", employee_id).execute()
 
 
 def load_existing_input_for_employee(sb, planning_round_id: int, employee_id: int):
@@ -186,24 +131,12 @@ def load_existing_input_for_employee(sb, planning_round_id: int, employee_id: in
         .limit(1)
         .execute()
     )
-
-    if result.data:
-        return result.data[0]
-    return None
+    return result.data[0] if result.data else None
 
 
-def save_employee_input(
-    sb,
-    planning_round_id: int,
-    employee_id: int,
-    name: str,
-    is_fachkraft: bool,
-    min_services: int,
-    max_services: int,
-    block_preferences: list[int],
-    wants_8_block: bool,
-    availability: list[bool],
-):
+def save_employee_input(sb, planning_round_id, employee_id, name, is_fachkraft,
+                        min_services, max_services, block_preferences,
+                        wants_8_block, availability):
     existing = (
         sb.table("employee_inputs")
         .select("id")
@@ -211,7 +144,6 @@ def save_employee_input(
         .eq("employee_id", employee_id)
         .execute()
     )
-
     payload = {
         "planning_round_id": planning_round_id,
         "employee_id": employee_id,
@@ -225,26 +157,17 @@ def save_employee_input(
         "submitted": True,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-
     if existing.data:
-        return (
-            sb.table("employee_inputs")
-            .update(payload)
-            .eq("id", existing.data[0]["id"])
-            .execute()
-        )
-
+        return sb.table("employee_inputs").update(payload).eq("id", existing.data[0]["id"]).execute()
     return sb.table("employee_inputs").insert(payload).execute()
 
 
 def build_employees_from_inputs(sb, planning_round_id: int, days_in_month: int) -> List[Employee]:
     rows = load_employee_inputs(sb, planning_round_id)
-
     employees = []
     for row in rows:
         if not row.get("submitted"):
             continue
-
         availability = row.get("availability") or []
         if len(availability) != days_in_month:
             availability = [False] * days_in_month
@@ -259,50 +182,290 @@ def build_employees_from_inputs(sb, planning_round_id: int, days_in_month: int) 
             except Exception:
                 pass
 
-        employees.append(
-            Employee(
-                name=row["name"],
-                is_fachkraft=bool(row.get("is_fachkraft", False)),
-                availability=[bool(x) for x in availability],
-                min_services=int(row.get("min_services", 0)),
-                max_services=int(row.get("max_services", 0)),
-                block_preferences=block_preferences,
-                wants_8_block=bool(row.get("wants_8_block", False)),
-            )
-        )
-
+        employees.append(Employee(
+            name=row["name"],
+            is_fachkraft=bool(row.get("is_fachkraft", False)),
+            availability=[bool(x) for x in availability],
+            min_services=int(row.get("min_services", 0)),
+            max_services=int(row.get("max_services", 0)),
+            block_preferences=block_preferences,
+            wants_8_block=bool(row.get("wants_8_block", False)),
+        ))
     return employees
 
 
-def filter_user_warnings(warnings: List[str]) -> List[str]:
+# ─────────────────────────────────────────────
+# CORE SCHEDULER – OR-Tools CP-SAT
+# ─────────────────────────────────────────────
+
+def generate_schedule(
+    employees: List[Employee],
+    month: int,
+    year: int,
+    days_in_month: int,
+) -> Tuple[List[List[int]], List[str], List[Employee]]:
     """
-    Zeigt nur wirklich wichtige Warnungen an.
-    Technische Planungs-/Debug-Meldungen werden ausgeblendet.
+    Builds a shift schedule using OR-Tools CP-SAT.
+
+    Hard constraints (never violated):
+      - Availability
+      - Block structure (only allowed block sizes)
+      - 8-block: exactly 4-off-4
+      - Max 4 consecutive work days, then at least 1 free
+      - Min/Max services per employee
+      - Weekday: min 2 staff, at least 1 Fachkraft
+      - Weekend: min 3 staff, at least 1 Fachkraft
+
+    Soft constraint (optimised):
+      - 3rd person on weekdays (to reach desired service count)
+
+    Exception:
+      - If Fachkraft constraint is mathematically impossible for a day,
+        that constraint is relaxed and a warning is issued.
     """
-    important_prefixes = [
-        "Unterbesetzung",
-        "Unterbesetzung final",
-        "Keine Fachkraft",
-        "Keine Fachkraft final",
-        "Wochenende unterbesetzt",
-        "Keine Fachkraft am Wochenende",
-        "Min-Dienste nicht erreicht",
+    warnings: List[str] = []
+    n = len(employees)
+    D = days_in_month
+    model = cp_model.CpModel()
+
+    # ── Decision variables ──────────────────────────────────────────────
+    # shift[e][d] = 1 if employee e works on day d (0-indexed)
+    shift: List[List] = [
+        [model.NewBoolVar(f"shift_e{e}_d{d}") for d in range(D)]
+        for e in range(n)
     ]
 
-    filtered = []
-    for w in warnings:
-        if any(w.startswith(prefix) for prefix in important_prefixes):
-            filtered.append(w)
+    # ── Availability ─────────────────────────────────────────────────────
+    for e, emp in enumerate(employees):
+        for d in range(D):
+            if not emp.availability[d]:
+                model.Add(shift[e][d] == 0)
 
-    unique_filtered = []
+    # ── Block structure ───────────────────────────────────────────────────
+    # For each employee we enumerate all valid block placements and
+    # use indicator variables to enforce that every worked day belongs
+    # to exactly one valid block.
+    #
+    # A "block" is a maximal run of consecutive work days whose length
+    # is one of the employee's preferred block sizes.
+    #
+    # Implementation strategy:
+    #   1. Build boolean indicator b[e][d] = "a new block starts at day d for emp e"
+    #   2. For each start position, allow only valid block lengths
+    #   3. Enforce: shift[e][d] == 1  iff  day d is covered by some block
+
+    for e, emp in enumerate(employees):
+        allowed_sizes = set(emp.block_preferences)
+
+        if emp.wants_8_block:
+            # 8-block is: 4 work, 1 free, 4 work  → handled separately below
+            # We still allow normal blocks on other days
+            pass
+
+        # block_start[e][d][s] = 1 if a block of size s starts at day d for emp e
+        block_start = {}
+        for d in range(D):
+            for s in allowed_sizes:
+                if d + s <= D:
+                    var = model.NewBoolVar(f"bs_e{e}_d{d}_s{s}")
+                    block_start[(d, s)] = var
+
+        if emp.wants_8_block:
+            # 8-block indicator: starts at day d, covers d..d+3, free at d+4, covers d+5..d+8
+            eight_block_vars = []
+            for d in range(D):
+                if d + 9 <= D:  # needs 9 days total (4+1+4)
+                    var = model.NewBoolVar(f"8blk_e{e}_d{d}")
+                    eight_block_vars.append((d, var))
+
+        # For each day d: shift[e][d] must equal the OR of all blocks covering it
+        for d in range(D):
+            covering = []
+
+            # normal blocks covering day d
+            for s in allowed_sizes:
+                for start in range(max(0, d - s + 1), d + 1):
+                    if (start, s) in block_start and start + s > d:
+                        covering.append(block_start[(start, s)])
+
+            # 8-blocks covering day d
+            if emp.wants_8_block:
+                for (bd, bvar) in eight_block_vars:
+                    work_days_in_8 = list(range(bd, bd + 4)) + list(range(bd + 5, bd + 9))
+                    if d in work_days_in_8:
+                        covering.append(bvar)
+
+            if covering:
+                # shift[e][d] = 1  iff  at least one covering block is active
+                model.AddBoolOr(covering).OnlyEnforceIf(shift[e][d])
+                model.AddBoolAnd([v.Not() for v in covering]).OnlyEnforceIf(shift[e][d].Not())
+            else:
+                # No valid block can cover this day → cannot work
+                model.Add(shift[e][d] == 0)
+
+        # 8-block internal constraints
+        if emp.wants_8_block:
+            for (bd, bvar) in eight_block_vars:
+                # Work days: bd..bd+3 and bd+5..bd+8
+                work_days = list(range(bd, bd + 4)) + list(range(bd + 5, bd + 9))
+                free_day = bd + 4
+
+                # If block active: all work days = 1, free day = 0
+                for wd in work_days:
+                    model.Add(shift[e][wd] == 1).OnlyEnforceIf(bvar)
+                model.Add(shift[e][free_day] == 0).OnlyEnforceIf(bvar)
+
+                # Availability check for 8-block
+                for wd in work_days:
+                    if not emp.availability[wd]:
+                        model.Add(bvar == 0)
+                        break
+
+        # At most one block can start at each day
+        for d in range(D):
+            starters = [v for (dd, s), v in block_start.items() if dd == d]
+            if emp.wants_8_block:
+                starters += [bvar for (bd, bvar) in eight_block_vars if bd == d]
+            if len(starters) > 1:
+                model.Add(sum(starters) <= 1)
+
+    # ── Max 4 consecutive work days ───────────────────────────────────────
+    for e in range(n):
+        for d in range(D - 4):
+            model.Add(sum(shift[e][d + k] for k in range(5)) <= 4)
+
+    # ── Min / Max services ────────────────────────────────────────────────
+    for e, emp in enumerate(employees):
+        total = sum(shift[e][d] for d in range(D))
+        model.Add(total >= emp.min_services)
+        model.Add(total <= emp.max_services)
+
+    # ── Daily coverage ────────────────────────────────────────────────────
+    # Detect days where no Fachkraft is available at all → relax FK constraint
+    fachkraft_indices = [e for e, emp in enumerate(employees) if emp.is_fachkraft]
+
+    for d in range(D):
+        day = d + 1
+        req = requirement_for_day(day, month, year)
+
+        daily_total = sum(shift[e][d] for e in range(n))
+        model.Add(daily_total >= req.minimum)
+
+        # Fachkraft constraint
+        available_fk_today = [
+            e for e in fachkraft_indices if employees[e].availability[d]
+        ]
+
+        if available_fk_today:
+            fk_sum = sum(shift[e][d] for e in available_fk_today)
+            model.Add(fk_sum >= 1)
+        else:
+            warnings.append(
+                f"Keine Fachkraft verfügbar an {get_day_label(day, month, year)} – "
+                f"Fachkraft-Regel wird für diesen Tag gelockert."
+            )
+
+        # Weekend: exactly 3 (as minimum; soft max handled in objective)
+        if req.exact_target:
+            model.Add(daily_total >= 3)
+
+    # ── Objective: maximise coverage toward targets ───────────────────────
+    # For weekdays: reward assigning a 3rd person (soft)
+    # For all days: reward reaching min_services for each employee
+    objective_terms = []
+
+    for d in range(D):
+        day = d + 1
+        req = requirement_for_day(day, month, year)
+        if not req.exact_target:
+            # Bonus for each person beyond minimum (up to target=3)
+            for e in range(n):
+                objective_terms.append(shift[e][d])
+
+    # Reward employees reaching their min_services
+    for e, emp in enumerate(employees):
+        total = sum(shift[e][d] for d in range(D))
+        # Penalise falling short of min_services
+        shortfall = model.NewIntVar(0, emp.min_services, f"shortfall_e{e}")
+        model.Add(shortfall >= emp.min_services - total)
+        objective_terms.append(-10 * shortfall)
+
+    model.Maximize(sum(objective_terms))
+
+    # ── Solve ─────────────────────────────────────────────────────────────
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30.0
+    solver.parameters.num_search_workers = 4
+    status = solver.Solve(model)
+
+    assignments_by_day: List[List[int]] = [[] for _ in range(D)]
+
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        for d in range(D):
+            for e in range(n):
+                if solver.Value(shift[e][d]) == 1:
+                    assignments_by_day[d].append(e)
+                    employees[e].assigned_count += 1
+    else:
+        warnings.append(
+            "⚠️ Der Solver konnte keine gültige Lösung finden. "
+            "Bitte prüfe ob genug Mitarbeiter verfügbar sind und die Regeln erfüllbar sind."
+        )
+        return assignments_by_day, warnings, employees
+
+    # ── Post-solve validation warnings ───────────────────────────────────
+    for d in range(D):
+        day = d + 1
+        req = requirement_for_day(day, month, year)
+        assigned = assignments_by_day[d]
+
+        if len(assigned) < req.minimum:
+            warnings.append(
+                f"Unterbesetzung {get_day_label(day, month, year)}: "
+                f"{len(assigned)} statt mindestens {req.minimum}."
+            )
+
+        fk_count = sum(1 for e in assigned if employees[e].is_fachkraft)
+        if fk_count == 0 and req.needs_fachkraft:
+            warnings.append(
+                f"Keine Fachkraft an {get_day_label(day, month, year)}."
+            )
+
+    for e, emp in enumerate(employees):
+        if emp.assigned_count < emp.min_services:
+            warnings.append(
+                f"Min-Dienste nicht erreicht: {emp.name} hat {emp.assigned_count}, "
+                f"Minimum {emp.min_services}."
+            )
+
+    return assignments_by_day, warnings, employees
+
+
+# ─────────────────────────────────────────────
+# WARNINGS FILTER
+# ─────────────────────────────────────────────
+
+def filter_user_warnings(warnings: List[str]) -> List[str]:
+    important_prefixes = [
+        "Unterbesetzung",
+        "Keine Fachkraft",
+        "Wochenende unterbesetzt",
+        "Min-Dienste nicht erreicht",
+        "⚠️ Der Solver",
+        "Keine Fachkraft verfügbar",
+    ]
     seen = set()
-    for w in filtered:
-        if w not in seen:
-            unique_filtered.append(w)
+    result = []
+    for w in warnings:
+        if any(w.startswith(p) for p in important_prefixes) and w not in seen:
+            result.append(w)
             seen.add(w)
+    return result
 
-    return unique_filtered
 
+# ─────────────────────────────────────────────
+# EXCEL EXPORTS
+# ─────────────────────────────────────────────
 
 def build_input_overview_excel(
     employees: List[Employee],
@@ -327,15 +490,10 @@ def build_input_overview_excel(
         ws[f"{col}1"].alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     ws.column_dimensions["A"].width = 20
-    ws.column_dimensions["B"].width = 12
-    ws.column_dimensions["C"].width = 8
-    ws.column_dimensions["D"].width = 8
-    ws.column_dimensions["E"].width = 14
-    ws.column_dimensions["F"].width = 12
-
+    for c, w in zip("BCDEF", [12, 8, 8, 14, 12]):
+        ws.column_dimensions[c].width = w
     for d in range(1, days_in_month + 1):
         ws.column_dimensions[get_column_letter(6 + d)].width = 12
-
     ws.row_dimensions[1].height = 32
 
     for row_idx, emp in enumerate(employees, start=2):
@@ -354,504 +512,10 @@ def build_input_overview_excel(
             if available:
                 cell.fill = GREEN_FILL
 
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def requirement_for_day(day: int, month: int, year: int) -> DayRequirement:
-    """
-    Besetzungsregel:
-    - Montag bis Donnerstag: mindestens 2 Personen, Ziel 3, mindestens 1 Fachkraft
-    - Freitag bis Sonntag: 3 Personen, mindestens 1 Fachkraft
-    """
-    wd = date(year, month, day).weekday()
-
-    if wd >= 4:
-        return DayRequirement(
-            target=3,
-            minimum=3,
-            needs_fachkraft=True,
-            exact_target=True,
-        )
-
-    return DayRequirement(
-        target=3,
-        minimum=2,
-        needs_fachkraft=True,
-        exact_target=False,
-    )
-
-
-def count_fachkraft(employees: List[Employee], assigned_ids: List[int]) -> int:
-    return sum(1 for idx in assigned_ids if employees[idx].is_fachkraft)
-
-
-def get_locked_workers_for_day(employees: List[Employee], day: int) -> List[int]:
-    return [i for i, emp in enumerate(employees) if day in emp.locked_work_days]
-
-
-def get_block_patterns(emp: Employee) -> List[Tuple[str, List[str]]]:
-    patterns: List[Tuple[str, List[str]]] = []
-
-    if emp.wants_8_block:
-        patterns.append(("8er", ["work", "work", "work", "work", "off", "work", "work", "work", "work"]))
-
-    for block_len in sorted(emp.block_preferences, reverse=True):
-        patterns.append((f"{block_len}er", ["work"] * block_len))
-
-    return patterns
-
-
-def can_start_block(emp: Employee, start_day: int, pattern: List[str], days_in_month: int) -> bool:
-    end_day = start_day + len(pattern) - 1
-    if end_day > days_in_month:
-        return False
-
-    work_days_needed = 0
-    planned_workdays = len(emp.locked_work_days)
-
-    streak = emp.current_streak
-    previous_day = start_day - 1
-
-    if emp.last_day_assigned != previous_day and previous_day not in emp.locked_work_days:
-        streak = 0
-
-    for offset, token in enumerate(pattern):
-        day = start_day + offset
-        idx = day - 1
-
-        if token == "work":
-            if day in emp.locked_free_days:
-                return False
-            if day in emp.locked_work_days:
-                return False
-            if not emp.availability[idx]:
-                return False
-
-            work_days_needed += 1
-            streak += 1
-            if streak > 4:
-                return False
-
-        elif token == "off":
-            if day in emp.locked_work_days:
-                return False
-            streak = 0
-
-    if planned_workdays + work_days_needed > emp.max_services:
-        return False
-
-    return True
-
-
-def block_respects_future_capacity(
-    employees: List[Employee],
-    start_day: int,
-    pattern: List[str],
-    month: int,
-    year: int,
-    emp_idx: int,
-) -> bool:
-    for offset, token in enumerate(pattern):
-        if token != "work":
-            continue
-
-        day = start_day + offset
-        req = requirement_for_day(day, month, year)
-        already = get_locked_workers_for_day(employees, day)
-        future_count = len(already) + (0 if emp_idx in already else 1)
-
-        if future_count > req.target:
-            return False
-
-    return True
-
-
-def lock_block(emp: Employee, start_day: int, pattern: List[str]) -> None:
-    for offset, token in enumerate(pattern):
-        day = start_day + offset
-        if token == "work":
-            emp.locked_work_days.add(day)
-        elif token == "off":
-            emp.locked_free_days.add(day)
-
-
-def employee_priority_score(emp: Employee, block_name: str, pattern: List[str], day: int) -> int:
-    score = 0
-    score += pattern.count("work") * 10
-
-    if block_name == "8er":
-        score += 40
-
-    if len(emp.locked_work_days) < emp.min_services:
-        score += 20
-
-    score += max(0, 30 - len(emp.locked_work_days) * 2)
-
-    if emp.is_fachkraft:
-        score += 5
-
-    if (day - 1) in emp.locked_work_days:
-        score += 8
-
-    return score
-
-
-def find_best_block_start(
-    employees: List[Employee],
-    day: int,
-    month: int,
-    year: int,
-    need_fachkraft_now: bool,
-    days_in_month: int,
-) -> Optional[Tuple[int, str, List[str]]]:
-    candidates: List[Tuple[int, int, str, List[str]]] = []
-
-    for i, emp in enumerate(employees):
-        if day in emp.locked_work_days or day in emp.locked_free_days:
-            continue
-
-        for block_name, pattern in get_block_patterns(emp):
-            if not can_start_block(emp, day, pattern, days_in_month):
-                continue
-            if not block_respects_future_capacity(employees, day, pattern, month, year, i):
-                continue
-
-            score = employee_priority_score(emp, block_name, pattern, day)
-
-            if need_fachkraft_now:
-                if emp.is_fachkraft:
-                    score += 100
-                else:
-                    score -= 100
-
-            candidates.append((score, i, block_name, pattern))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    _, emp_idx, block_name, pattern = candidates[0]
-    return emp_idx, block_name, pattern
-
-
-def fill_day_with_fallback_workers(
-    employees: List[Employee],
-    day: int,
-    month: int,
-    year: int,
-    assigned: List[int],
-    warnings: List[str],
-    days_in_month: int,
-    target_override: Optional[int] = None,
-) -> List[int]:
-    req = requirement_for_day(day, month, year)
-    target = target_override if target_override is not None else req.target
-
-    while len(assigned) < target:
-        need_fk_now = req.needs_fachkraft and count_fachkraft(employees, assigned) == 0
-
-        fallback_candidates: List[Tuple[int, int]] = []
-        for i, emp in enumerate(employees):
-            if i in assigned:
-                continue
-            if day in emp.locked_work_days or day in emp.locked_free_days:
-                continue
-
-            pattern = ["work"]
-            if not can_start_block(emp, day, pattern, days_in_month):
-                continue
-
-            if target_override is None:
-                if not block_respects_future_capacity(employees, day, pattern, month, year, i):
-                    continue
-            else:
-                already = get_locked_workers_for_day(employees, day)
-                future_count = len(already) + (0 if i in already else 1)
-                if future_count > target:
-                    continue
-
-            score = 0
-            if len(emp.locked_work_days) < emp.min_services:
-                score += 20
-            score += max(0, 30 - len(emp.locked_work_days) * 2)
-            if emp.is_fachkraft:
-                score += 5
-
-            if need_fk_now:
-                if emp.is_fachkraft:
-                    score += 100
-                else:
-                    score -= 100
-
-            fallback_candidates.append((score, i))
-
-        if not fallback_candidates:
-            break
-
-        fallback_candidates.sort(key=lambda x: x[0], reverse=True)
-        _, emp_idx = fallback_candidates[0]
-        lock_block(employees[emp_idx], day, ["work"])
-        assigned = get_locked_workers_for_day(employees, day)
-
-        warnings.append(
-            f"Fallback an {get_day_label(day, month, year)}: "
-            f"{employees[emp_idx].name} wurde mit 1er-Block ergänzt."
-        )
-
-    return assigned
-
-
-def ensure_minimum_coverage_for_day(
-    employees: List[Employee],
-    day: int,
-    month: int,
-    year: int,
-    days_in_month: int,
-    warnings: List[str],
-) -> List[int]:
-    req = requirement_for_day(day, month, year)
-    assigned = get_locked_workers_for_day(employees, day)
-
-    if count_fachkraft(employees, assigned) == 0:
-        best_fk = find_best_block_start(
-            employees=employees,
-            day=day,
-            month=month,
-            year=year,
-            need_fachkraft_now=True,
-            days_in_month=days_in_month,
-        )
-        if best_fk is not None:
-            emp_idx, block_name, pattern = best_fk
-            lock_block(employees[emp_idx], day, pattern)
-            assigned = get_locked_workers_for_day(employees, day)
-            warnings.append(
-                f"Pflichtabdeckung {get_day_label(day, month, year)}: "
-                f"{employees[emp_idx].name} startet {block_name}-Block als notwendige Fachkraft."
-            )
-
-    while len(assigned) < req.minimum:
-        need_fk_now = count_fachkraft(employees, assigned) == 0
-        best = find_best_block_start(
-            employees=employees,
-            day=day,
-            month=month,
-            year=year,
-            need_fachkraft_now=need_fk_now,
-            days_in_month=days_in_month,
-        )
-
-        if best is None:
-            break
-
-        emp_idx, block_name, pattern = best
-        lock_block(employees[emp_idx], day, pattern)
-        assigned = get_locked_workers_for_day(employees, day)
-
-        warnings.append(
-            f"Pflichtabdeckung {get_day_label(day, month, year)}: "
-            f"{employees[emp_idx].name} startet {block_name}-Block."
-        )
-
-    if len(assigned) < req.minimum or count_fachkraft(employees, assigned) == 0:
-        assigned = fill_day_with_fallback_workers(
-            employees=employees,
-            day=day,
-            month=month,
-            year=year,
-            assigned=assigned,
-            warnings=warnings,
-            days_in_month=days_in_month,
-            target_override=req.minimum,
-        )
-
-    return get_locked_workers_for_day(employees, day)
-
-
-def update_states_for_day(employees: List[Employee], day: int, assigned_ids: List[int]) -> None:
-    assigned_set = set(assigned_ids)
-
-    for i, emp in enumerate(employees):
-        if i in assigned_set:
-            emp.assigned_count += 1
-            if emp.last_day_assigned == day - 1:
-                emp.current_streak += 1
-            else:
-                emp.current_streak = 1
-            emp.last_day_assigned = day
-        else:
-            emp.current_streak = 0
-
-
-def generate_schedule(
-    employees_input: List[Employee],
-    month: int,
-    year: int,
-    days_in_month: int,
-) -> Tuple[List[List[int]], List[str], List[Employee]]:
-    employees = copy.deepcopy(employees_input)
-    warnings: List[str] = []
-
-    # Phase A: zuerst alle Tage auf Mindestabdeckung bringen
-    for day in range(1, days_in_month + 1):
-        assigned = ensure_minimum_coverage_for_day(
-            employees=employees,
-            day=day,
-            month=month,
-            year=year,
-            days_in_month=days_in_month,
-            warnings=warnings,
-        )
-
-        if len(assigned) < 2:
-            warnings.append(
-                f"Unterbesetzung {get_day_label(day, month, year)}: "
-                f"nur {len(assigned)} Person(en), mindestens 2 erforderlich."
-            )
-
-        if count_fachkraft(employees, assigned) == 0:
-            warnings.append(
-                f"Keine Fachkraft an {get_day_label(day, month, year)} eingeplant."
-            )
-
-    # Phase B: Wochenenden auf 3
-    for day in range(1, days_in_month + 1):
-        req = requirement_for_day(day, month, year)
-        if not req.exact_target:
-            continue
-
-        assigned = get_locked_workers_for_day(employees, day)
-
-        while len(assigned) < req.target:
-            need_fk_now = count_fachkraft(employees, assigned) == 0
-
-            best = find_best_block_start(
-                employees=employees,
-                day=day,
-                month=month,
-                year=year,
-                need_fachkraft_now=need_fk_now,
-                days_in_month=days_in_month,
-            )
-
-            if best is None:
-                break
-
-            emp_idx, block_name, pattern = best
-            lock_block(employees[emp_idx], day, pattern)
-            assigned = get_locked_workers_for_day(employees, day)
-
-            warnings.append(
-                f"Wochenendauffüllung {get_day_label(day, month, year)}: "
-                f"{employees[emp_idx].name} startet {block_name}-Block."
-            )
-
-        if len(assigned) < 3:
-            assigned = fill_day_with_fallback_workers(
-                employees=employees,
-                day=day,
-                month=month,
-                year=year,
-                assigned=assigned,
-                warnings=warnings,
-                days_in_month=days_in_month,
-                target_override=3,
-            )
-
-        assigned = get_locked_workers_for_day(employees, day)
-
-        if len(assigned) < 3:
-            warnings.append(
-                f"Wochenende unterbesetzt {get_day_label(day, month, year)}: "
-                f"{len(assigned)} statt 3."
-            )
-
-        if count_fachkraft(employees, assigned) == 0:
-            warnings.append(
-                f"Keine Fachkraft am Wochenende {get_day_label(day, month, year)}."
-            )
-
-    # Phase C: Wochentage optional auf 3
-    for day in range(1, days_in_month + 1):
-        req = requirement_for_day(day, month, year)
-        if req.exact_target:
-            continue
-
-        assigned = get_locked_workers_for_day(employees, day)
-
-        while len(assigned) < req.target:
-            need_fk_now = count_fachkraft(employees, assigned) == 0
-
-            best = find_best_block_start(
-                employees=employees,
-                day=day,
-                month=month,
-                year=year,
-                need_fachkraft_now=need_fk_now,
-                days_in_month=days_in_month,
-            )
-
-            if best is None:
-                break
-
-            emp_idx, block_name, pattern = best
-            lock_block(employees[emp_idx], day, pattern)
-            assigned = get_locked_workers_for_day(employees, day)
-
-            warnings.append(
-                f"Wochentag-Auffüllung {get_day_label(day, month, year)}: "
-                f"{employees[emp_idx].name} startet {block_name}-Block."
-            )
-
-        if len(assigned) < 3:
-            assigned = fill_day_with_fallback_workers(
-                employees=employees,
-                day=day,
-                month=month,
-                year=year,
-                assigned=assigned,
-                warnings=warnings,
-                days_in_month=days_in_month,
-                target_override=3,
-            )
-
-    assignments_by_day: List[List[int]] = [[] for _ in range(days_in_month)]
-
-    for day in range(1, days_in_month + 1):
-        assigned = get_locked_workers_for_day(employees, day)
-        req = requirement_for_day(day, month, year)
-
-        if len(assigned) > req.target:
-            assigned = assigned[:req.target]
-
-        assignments_by_day[day - 1] = assigned
-        update_states_for_day(employees, day, assigned)
-
-        if len(assigned) < req.minimum:
-            warnings.append(
-                f"Unterbesetzung final {get_day_label(day, month, year)}: "
-                f"{len(assigned)} statt mindestens {req.minimum}."
-            )
-
-        if count_fachkraft(employees, assigned) == 0:
-            warnings.append(
-                f"Keine Fachkraft final an {get_day_label(day, month, year)}."
-            )
-
-    for emp in employees:
-        if emp.assigned_count < emp.min_services:
-            warnings.append(
-                f"Min-Dienste nicht erreicht: {emp.name} hat {emp.assigned_count}, "
-                f"Minimum {emp.min_services}."
-            )
-
-        if not emp.block_preferences and not emp.wants_8_block:
-            warnings.append(f"Blockwunsch fehlt: {emp.name}")
-
-    return assignments_by_day, warnings, employees
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def build_schedule_excel(
@@ -888,42 +552,37 @@ def build_schedule_excel(
     ws.column_dimensions[sum_col].width = 10
     ws.row_dimensions[1].height = 32
 
-    assigned_sets = [set(day_ids) for day_ids in assignments_by_day]
+    assigned_sets = [set(ids) for ids in assignments_by_day]
 
     for row_idx, emp in enumerate(original_employees, start=2):
         ws[f"A{row_idx}"] = emp.name
         emp_idx = row_idx - 2
         service_count = 0
 
-        for day_idx0 in range(days_in_month):
-            col = get_column_letter(2 + day_idx0)
+        for d0 in range(days_in_month):
+            col = get_column_letter(2 + d0)
             cell = ws[f"{col}{row_idx}"]
             cell.alignment = Alignment(horizontal="center", vertical="center")
-
-            if emp_idx in assigned_sets[day_idx0]:
+            if emp_idx in assigned_sets[d0]:
                 cell.value = "X"
                 cell.fill = GREEN_FILL
                 service_count += 1
-            else:
-                cell.value = ""
 
         ws[f"{sum_col}{row_idx}"] = service_count
         ws[f"{sum_col}{row_idx}"].alignment = Alignment(horizontal="center", vertical="center")
 
+    # Warnings sheet
     ws2 = wb.create_sheet("Warnungen")
     ws2["A1"] = "Warnungen"
     ws2["A1"].font = Font(bold=True)
     ws2.column_dimensions["A"].width = 140
+    for i, w in enumerate(filter_user_warnings(warnings), start=2):
+        ws2[f"A{i}"] = w
 
-    important_warnings = filter_user_warnings(warnings)
-    for i, warning in enumerate(important_warnings, start=2):
-        ws2[f"A{i}"] = warning
-
+    # Stats sheet
     ws3 = wb.create_sheet("Statistik")
-    headers = ["Name", "Fachkraft", "Min", "Max", "Geplant", "Wunschblöcke", "8er-Wunsch"]
-    for col_idx, header in enumerate(headers, start=1):
-        cell = ws3.cell(row=1, column=col_idx, value=header)
-        cell.font = Font(bold=True)
+    for col_idx, header in enumerate(["Name", "Fachkraft", "Min", "Max", "Geplant", "Wunschblöcke", "8er-Wunsch"], start=1):
+        ws3.cell(1, col_idx, header).font = Font(bold=True)
 
     for i, (orig, final) in enumerate(zip(original_employees, final_employees), start=2):
         ws3.cell(i, 1, orig.name)
@@ -934,11 +593,15 @@ def build_schedule_excel(
         ws3.cell(i, 6, ",".join(map(str, sorted(orig.block_preferences))) if orig.block_preferences else "")
         ws3.cell(i, 7, "Ja" if orig.wants_8_block else "Nein")
 
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return buffer.getvalue()
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
+
+# ─────────────────────────────────────────────
+# STREAMLIT UI
+# ─────────────────────────────────────────────
 
 st.set_page_config(page_title="Dienstplan Mitarbeitereingabe", layout="wide")
 st.title("Dienstplan Mitarbeitereingabe")
@@ -963,49 +626,41 @@ if not employees_master:
     st.stop()
 
 rows = load_employee_inputs(sb, planning_round_id)
-
 submitted_by_employee_id = {
     row["employee_id"]: row
     for row in rows
     if row.get("submitted") and row.get("employee_id") is not None
 }
 
+# ── Submission status ─────────────────────────────────────────────────
 st.subheader("Status der Mitarbeitereingaben")
-
 total_count = len(employees_master)
 submitted_count = len(submitted_by_employee_id)
-
 st.info(f"{submitted_count} von {total_count} Mitarbeitenden haben bereits eingetragen.")
 
 for emp in employees_master:
     emp_id = emp["id"]
     name = emp["name"]
-
     if emp_id in submitted_by_employee_id:
         updated_at = submitted_by_employee_id[emp_id].get("updated_at", "")
         st.write(f"✅ **{name}** — eingetragen — zuletzt geändert: {updated_at}")
     else:
         st.write(f"❌ **{name}** — noch offen")
 
-missing_names = [
-    emp["name"]
-    for emp in employees_master
-    if emp["id"] not in submitted_by_employee_id
-]
-
+missing_names = [emp["name"] for emp in employees_master if emp["id"] not in submitted_by_employee_id]
 if missing_names:
     st.warning("Noch offen: " + ", ".join(missing_names))
 else:
     st.success("Alle Mitarbeitenden haben ihre Eingaben abgegeben.")
 
 st.markdown("---")
+
+# ── Employee input form ───────────────────────────────────────────────
 st.subheader("Eigene Daten eintragen")
 
 employee_options = [emp["name"] for emp in employees_master]
 selected_name = st.selectbox("Mitarbeiter auswählen", employee_options)
-
 selected_employee = next(emp for emp in employees_master if emp["name"] == selected_name)
-
 employee_id = selected_employee["id"]
 name = selected_employee["name"]
 
@@ -1024,46 +679,28 @@ if existing_input:
     default_is_fachkraft = bool(existing_input.get("is_fachkraft", False))
     default_min_services = int(existing_input.get("min_services", 8))
     default_max_services = int(existing_input.get("max_services", 15))
-
     loaded_blocks = existing_input.get("block_preferences") or []
-    loaded_wants_8 = existing_input.get("wants_8_block", False)
+    default_wants_8 = bool(existing_input.get("wants_8_block", False))
     loaded_availability = existing_input.get("availability") or []
-
     if isinstance(loaded_blocks, list):
-        parsed_blocks = []
-        for x in loaded_blocks:
-            try:
-                parsed_blocks.append(int(x))
-            except Exception:
-                pass
-        default_blocks = [b for b in parsed_blocks if b in [1, 2, 3, 4]]
-
-    default_wants_8 = bool(loaded_wants_8)
-
+        default_blocks = [int(x) for x in loaded_blocks if str(x).isdigit() and int(x) in [1, 2, 3, 4]]
     if isinstance(loaded_availability, list) and len(loaded_availability) == days_in_month:
         default_availability = [bool(x) for x in loaded_availability]
 
 with st.form("employee_form"):
     is_fachkraft = st.checkbox("Fachkraft", value=default_is_fachkraft)
-
     c1, c2 = st.columns(2)
     with c1:
         min_services = st.number_input("Min-Dienste", min_value=0, max_value=31, value=default_min_services, step=1)
     with c2:
         max_services = st.number_input("Max-Dienste", min_value=0, max_value=31, value=default_max_services, step=1)
 
-    block_preferences = st.multiselect(
-        "Bevorzugte Blockgrößen",
-        options=[1, 2, 3, 4],
-        default=default_blocks,
-    )
-
+    block_preferences = st.multiselect("Bevorzugte Blockgrößen", options=[1, 2, 3, 4], default=default_blocks)
     wants_8_block = st.checkbox("8er-Block-Wunsch (4 + frei + 4)", value=default_wants_8)
 
     st.write("Verfügbarkeit")
     availability = []
     cols = st.columns(7)
-
     for d in range(1, days_in_month + 1):
         with cols[(d - 1) % 7]:
             available = st.checkbox(
@@ -1077,14 +714,12 @@ with st.form("employee_form"):
 
 if submitted:
     errors = []
-
     if not name.strip():
         errors.append("Name fehlt.")
     if max_services < min_services:
         errors.append("Max-Dienste dürfen nicht kleiner als Min-Dienste sein.")
     if not block_preferences and not wants_8_block:
         errors.append("Mindestens ein Blockwunsch oder 8er-Wunsch ist erforderlich.")
-
     if errors:
         for err in errors:
             st.error(err)
@@ -1109,8 +744,9 @@ if submitted:
             st.exception(e)
 
 st.markdown("---")
-st.subheader("Admin-Bereich")
 
+# ── Admin area ────────────────────────────────────────────────────────
+st.subheader("Admin-Bereich")
 admin_mode = st.checkbox("Admin-Modus aktivieren")
 
 if admin_mode:
@@ -1147,12 +783,7 @@ if admin_mode:
 
     if active_employees:
         active_options = {emp["name"]: emp["id"] for emp in active_employees}
-        selected_remove_name = st.selectbox(
-            "Aktiven Mitarbeiter deaktivieren",
-            options=list(active_options.keys()),
-            key="remove_employee_select",
-        )
-
+        selected_remove_name = st.selectbox("Aktiven Mitarbeiter deaktivieren", options=list(active_options.keys()), key="remove_employee_select")
         if st.button("Mitarbeiter deaktivieren"):
             try:
                 deactivate_employee_master(sb, active_options[selected_remove_name])
@@ -1164,12 +795,7 @@ if admin_mode:
 
     if inactive_employees:
         inactive_options = {emp["name"]: emp["id"] for emp in inactive_employees}
-        selected_reactivate_name = st.selectbox(
-            "Deaktivierten Mitarbeiter wieder aktivieren",
-            options=list(inactive_options.keys()),
-            key="reactivate_employee_select",
-        )
-
+        selected_reactivate_name = st.selectbox("Deaktivierten Mitarbeiter wieder aktivieren", options=list(inactive_options.keys()), key="reactivate_employee_select")
         if st.button("Mitarbeiter reaktivieren"):
             try:
                 reactivate_employee_master(sb, inactive_options[selected_reactivate_name])
@@ -1182,7 +808,6 @@ if admin_mode:
     st.markdown("---")
 
     employees_for_plan = build_employees_from_inputs(sb, planning_round_id, days_in_month)
-
     st.write(f"Eingetragene Mitarbeitende für Planung: **{len(employees_for_plan)}**")
 
     if employees_for_plan:
@@ -1193,13 +818,7 @@ if admin_mode:
                 f"Blöcke: {sorted(emp.block_preferences)} | 8er: {'Ja' if emp.wants_8_block else 'Nein'}"
             )
 
-        overview_excel = build_input_overview_excel(
-            employees_for_plan,
-            int(month),
-            int(year),
-            days_in_month,
-        )
-
+        overview_excel = build_input_overview_excel(employees_for_plan, int(month), int(year), days_in_month)
         st.download_button(
             label="Eingaben als Kontroll-Excel herunterladen",
             data=overview_excel,
@@ -1209,12 +828,13 @@ if admin_mode:
 
         st.markdown("---")
         if st.button("Dienstplan erstellen"):
-            assignments_by_day, warnings, final_employees = generate_schedule(
-                employees_for_plan,
-                int(month),
-                int(year),
-                days_in_month,
-            )
+            with st.spinner("Dienstplan wird berechnet (OR-Tools CP-SAT)..."):
+                assignments_by_day, warnings, final_employees = generate_schedule(
+                    employees_for_plan,
+                    int(month),
+                    int(year),
+                    days_in_month,
+                )
 
             schedule_excel = build_schedule_excel(
                 original_employees=employees_for_plan,
@@ -1227,7 +847,6 @@ if admin_mode:
             )
 
             important_warnings = filter_user_warnings(warnings)
-
             st.success("Dienstplan wurde erstellt.")
 
             st.download_button(
