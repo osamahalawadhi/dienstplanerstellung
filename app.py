@@ -490,20 +490,64 @@ def generate_schedule(
                 if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     warnings.append("✅ Stufe 4: Plan erstellt – Wochenenden ggf. unterbesetzt.")
                 else:
-                    # ── Stage 5: Keine Lösung möglich ────────────────────
+                    # ── Stage 5: Alle Tagesminima komplett entfernen ──────
+                    # Plan wird trotzdem erstellt – nur Blockregeln + Max bleiben hart.
                     warnings.append(
-                        "❌ Stufe 5: Keine gültige Lösung möglich. "
-                        "Bitte prüfe die Verfügbarkeiten und Blockpräferenzen der Mitarbeiter."
+                        "⚠️ Stufe 5: Tagesminima werden vollständig entfernt – "
+                        "Plan wird mit verfügbaren Mitarbeitern bestmöglich befüllt."
                     )
-                    # Diagnose: welche Tage sind kritisch?
-                    for d in range(D):
-                        available_count = sum(1 for e in range(n) if employees[e].availability[d])
-                        if available_count < 1:
+                    # Override alle Tage auf Minimum 0
+                    weekday_min_override_5 = {d: 0 for d in range(D)}
+                    weekend_min_override_5 = {d: 0 for d in range(D)}
+
+                    model, shift = _build_model(
+                        employees, month, year, D,
+                        relax_min_services=True,
+                        weekday_min_override=weekday_min_override_5,
+                        weekend_min_override=weekend_min_override_5,
+                        relax_fachkraft_days=set(range(D)),  # alle Tage FK-frei
+                    )
+                    status, solver = _solve(model, shift, employees, D)
+
+                    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                        warnings.append(
+                            "✅ Stufe 5: Notfallplan erstellt – bitte Warnungen prüfen. "
+                            "Viele Tage sind möglicherweise unterbesetzt."
+                        )
+                    else:
+                        # Absoluter Notfall: nur Verfügbarkeit + Max, keine anderen Constraints
+                        warnings.append(
+                            "⚠️ Stufe 6: Minimaler Notfallplan – nur Verfügbarkeit und Max-Dienste werden beachtet."
+                        )
+                        model6 = cp_model.CpModel()
+                        shift6 = [
+                            [model6.NewBoolVar(f"s6_e{e}_d{d}") for d in range(D)]
+                            for e in range(n)
+                        ]
+                        # Nur Verfügbarkeit und Max
+                        for e, emp in enumerate(employees):
+                            for d in range(D):
+                                if not emp.availability[d]:
+                                    model6.Add(shift6[e][d] == 0)
+                            model6.Add(sum(shift6[e][d] for d in range(D)) <= emp.max_services)
+                        # Maximiere Besetzung
+                        model6.Maximize(sum(shift6[e][d] for e in range(n) for d in range(D)))
+                        solver6 = cp_model.CpSolver()
+                        solver6.parameters.max_time_in_seconds = 10.0
+                        status6 = solver6.Solve(model6)
+                        if status6 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                            shift = shift6
+                            solver = solver6
                             warnings.append(
-                                f"Kritisch: {get_day_label(d + 1, month, year)} – "
-                                f"0 Mitarbeiter verfügbar."
+                                "✅ Stufe 6: Notfallplan erstellt – Blockregeln konnten nicht eingehalten werden. "
+                                "Bitte Verfügbarkeiten und Blockpräferenzen der Mitarbeiter prüfen."
                             )
-                    return assignments_by_day, warnings, employees
+                        else:
+                            warnings.append(
+                                "❌ Kein Plan möglich – alle Mitarbeiter haben 0 verfügbare Tage. "
+                                "Bitte Verfügbarkeiten eintragen."
+                            )
+                            return assignments_by_day, warnings, employees
 
     # ── Ergebnis auslesen ─────────────────────────────────────────────────
     for d in range(D):
@@ -981,16 +1025,16 @@ if admin_mode:
         else:
             st.write("✅ Alle Tage haben ausreichend verfügbare Mitarbeiter.")
 
-        # Blockierung bei kritischen Fehlern
+        # Zusammenfassung der Diagnose – nur Info, kein Blockieren
         if pre_check_errors:
-            st.error(
-                "🚫 **Planung blockiert:** Bitte zuerst die rot markierten Probleme beheben. "
-                "Mitarbeiter ohne Verfügbarkeit müssen ihre Daten zuerst eintragen."
+            st.warning(
+                "⚠️ Einige Mitarbeiter haben Probleme (siehe oben). "
+                "Der Plan wird trotzdem erstellt – betroffene Mitarbeiter erhalten 0 Dienste."
             )
         elif pre_check_warnings_list:
             st.warning(
-                "⚠️ Es gibt Warnungen – der Plan wird trotzdem versucht, "
-                "aber manche Min-Dienste könnten unterschritten werden."
+                "⚠️ Bei einigen Mitarbeitern könnten Min-Dienste nicht erreichbar sein. "
+                "Der Plan wird trotzdem erstellt."
             )
         else:
             st.success("✅ Alle Prüfungen bestanden – Planung kann starten.")
@@ -1007,43 +1051,40 @@ if admin_mode:
 
         st.markdown("---")
 
-        if not pre_check_errors:
-            if st.button("Dienstplan erstellen"):
-                with st.spinner("Dienstplan wird berechnet (OR-Tools CP-SAT)..."):
-                    assignments_by_day, warnings, final_employees = generate_schedule(
-                        employees_for_plan,
-                        int(month),
-                        int(year),
-                        days_in_month,
-                    )
-
-                schedule_excel = build_schedule_excel(
-                    original_employees=employees_for_plan,
-                    final_employees=final_employees,
-                    assignments_by_day=assignments_by_day,
-                    warnings=warnings,
-                    month=int(month),
-                    year=int(year),
-                    days_in_month=days_in_month,
+        if st.button("Dienstplan erstellen"):
+            with st.spinner("Dienstplan wird berechnet (OR-Tools CP-SAT)..."):
+                assignments_by_day, warnings, final_employees = generate_schedule(
+                    employees_for_plan,
+                    int(month),
+                    int(year),
+                    days_in_month,
                 )
 
-                important_warnings = filter_user_warnings(warnings)
-                st.success("Dienstplan wurde erstellt.")
+            schedule_excel = build_schedule_excel(
+                original_employees=employees_for_plan,
+                final_employees=final_employees,
+                assignments_by_day=assignments_by_day,
+                warnings=warnings,
+                month=int(month),
+                year=int(year),
+                days_in_month=days_in_month,
+            )
 
-                st.download_button(
-                    label="Dienstplan als Excel herunterladen",
-                    data=schedule_excel,
-                    file_name=f"dienstplan_{int(month):02d}_{int(year)}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+            important_warnings = filter_user_warnings(warnings)
+            st.success("Dienstplan wurde erstellt.")
 
-                st.subheader("Warnungen")
-                if important_warnings:
-                    for warning in important_warnings:
-                        st.warning(warning)
-                else:
-                    st.info("Keine wichtigen Warnungen.")
-        else:
-            st.button("Dienstplan erstellen", disabled=True)
+            st.download_button(
+                label="Dienstplan als Excel herunterladen",
+                data=schedule_excel,
+                file_name=f"dienstplan_{int(month):02d}_{int(year)}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            st.subheader("Warnungen")
+            if important_warnings:
+                for warning in important_warnings:
+                    st.warning(warning)
+            else:
+                st.info("Keine wichtigen Warnungen.")
     else:
         st.warning("Noch keine vollständigen Mitarbeitereingaben vorhanden.")
