@@ -198,6 +198,72 @@ def build_employees_from_inputs(sb, planning_round_id: int, days_in_month: int) 
 # CORE SCHEDULER – OR-Tools CP-SAT
 # ─────────────────────────────────────────────
 
+def check_block_feasibility(
+    employees: List[Employee],
+    month: int,
+    year: int,
+    days_in_month: int,
+) -> List[str]:
+    """
+    Prüft ob jeder Mitarbeiter seine Min-Dienste mit seinen Blöcken erreichen kann.
+    Gibt Fehlermeldungen zurück (leer = alles ok).
+    """
+    D = days_in_month
+    errors = []
+
+    for emp in employees:
+        allowed_sizes = set(emp.block_preferences)
+
+        if emp.wants_8_block and not allowed_sizes:
+            # Nur 8er-Block: prüfe ob er mindestens einmal passt
+            eight_possible = False
+            for d in range(D):
+                if d + 9 <= D:
+                    work_days = list(range(d, d+4)) + list(range(d+5, d+9))
+                    if all(emp.availability[dd] for dd in work_days):
+                        eight_possible = True
+                        break
+            if not eight_possible:
+                errors.append(
+                    f"**{emp.name}**: 8er-Block kann nirgendwo platziert werden "
+                    f"(zu wenig aufeinanderfolgende verfügbare Tage)."
+                )
+            elif emp.min_services > 8:
+                errors.append(
+                    f"**{emp.name}**: Min-Dienste={emp.min_services}, aber 8er-Block "
+                    f"liefert maximal 8 Dienste."
+                )
+            continue
+
+        if not allowed_sizes:
+            continue
+
+        # Greedy: zähle maximal erreichbare Dienste mit erlaubten Blöcken
+        max_reachable = 0
+        d = 0
+        while d < D:
+            placed = False
+            for s in sorted(allowed_sizes, reverse=True):
+                if d + s <= D:
+                    if all(emp.availability[dd] for dd in range(d, d + s)):
+                        max_reachable += s
+                        d += s
+                        placed = True
+                        break
+            if not placed:
+                d += 1
+
+        if max_reachable < emp.min_services:
+            errors.append(
+                f"**{emp.name}**: Mit Blöcken {sorted(allowed_sizes)} und eingetragener "
+                f"Verfügbarkeit maximal {max_reachable} Dienste erreichbar, "
+                f"aber Min-Dienste = {emp.min_services}."
+            )
+
+    return errors
+
+
+
 def _build_model(
     employees: List[Employee],
     month: int,
@@ -279,44 +345,72 @@ def _build_model(
         for d in range(D - 4):
             model.Add(sum(shift[e][d + k] for k in range(5)) <= 4)
 
-    # ── Min / Max services – both strictly enforced ───────────────────────
+    # ── Min / Max services ────────────────────────────────────────────────
     for e, emp in enumerate(employees):
         total = sum(shift[e][d] for d in range(D))
         model.Add(total >= emp.min_services)
         model.Add(total <= emp.max_services)
 
-    # ── Daily coverage – strictly enforced ───────────────────────────────
+    # ── Daily coverage: SOFT via penalty variables ────────────────────────
+    # We never make coverage a hard constraint.
+    # Instead we penalise shortfalls heavily in the objective so the solver
+    # fills days as much as possible, but never returns INFEASIBLE.
     fachkraft_indices = [e for e, emp in enumerate(employees) if emp.is_fachkraft]
+
+    # shortfall_day[d]  = max(0, minimum_required - actual_assigned)
+    # fk_missing[d]     = 1 if no Fachkraft assigned on day d, else 0
+    shortfall_day = []
+    fk_missing = []
 
     for d in range(D):
         day = d + 1
         req = requirement_for_day(day, month, year)
         daily_total = sum(shift[e][d] for e in range(n))
 
-        # Minimum staffing – always hard
-        model.Add(daily_total >= req.minimum)
+        # Shortfall for staffing minimum
+        sf = model.NewIntVar(0, n, f"sf_d{d}")
+        model.Add(sf >= req.minimum - daily_total)
+        model.Add(sf >= 0)
+        shortfall_day.append(sf)
 
-        # Fachkraft – always hard
+        # Fachkraft missing indicator
         available_fk_today = [e for e in fachkraft_indices if employees[e].availability[d]]
         if available_fk_today:
-            model.Add(sum(shift[e][d] for e in available_fk_today) >= 1)
+            fk_sum = sum(shift[e][d] for e in available_fk_today)
+            fkm = model.NewBoolVar(f"fkm_d{d}")
+            # fkm = 1 when fk_sum == 0
+            model.Add(fk_sum == 0).OnlyEnforceIf(fkm)
+            model.Add(fk_sum >= 1).OnlyEnforceIf(fkm.Not())
+            fk_missing.append(fkm)
+        else:
+            # No FK available at all – nothing to penalise
+            fk_missing.append(None)
 
-    # ── Objective: fill up toward targets ────────────────────────────────
+    # ── Objective ────────────────────────────────────────────────────────
     objective_terms = []
 
-    # Reward 3rd person on weekdays (soft)
+    # Heavily penalise staffing shortfalls (hard-like behaviour)
+    for sf in shortfall_day:
+        objective_terms.append(-1000 * sf)
+
+    # Heavily penalise missing Fachkraft
+    for fkm in fk_missing:
+        if fkm is not None:
+            objective_terms.append(-1000 * fkm)
+
+    # Reward 3rd person on weekdays (soft, low weight)
     for d in range(D):
         req = requirement_for_day(d + 1, month, year)
         if not req.exact_target:
             for e in range(n):
                 objective_terms.append(shift[e][d])
 
-    # Reward reaching min_services
+    # Penalise shortfall vs min_services per employee
     for e, emp in enumerate(employees):
         total = sum(shift[e][d] for d in range(D))
-        shortfall = model.NewIntVar(0, emp.min_services, f"shortfall_e{e}")
-        model.Add(shortfall >= emp.min_services - total)
-        objective_terms.append(-10 * shortfall)
+        emp_sf = model.NewIntVar(0, emp.min_services, f"emp_sf_e{e}")
+        model.Add(emp_sf >= emp.min_services - total)
+        objective_terms.append(-10 * emp_sf)
 
     model.Maximize(sum(objective_terms))
     return model, shift
@@ -330,6 +424,82 @@ def _solve(model: cp_model.CpModel, shift, employees, days_in_month) -> Tuple[in
     return status, solver
 
 
+def _pre_solve_diagnostics(
+    employees: List[Employee],
+    month: int,
+    year: int,
+    days_in_month: int,
+) -> List[str]:
+    """
+    Check before solving whether rules are reachable.
+    Returns a list of warning strings – does NOT block the solve.
+    """
+    issues: List[str] = []
+    n = len(employees)
+    fachkraft_indices = [e for e, emp in enumerate(employees) if emp.is_fachkraft]
+
+    for d in range(days_in_month):
+        day = d + 1
+        req = requirement_for_day(day, month, year)
+
+        # How many employees could possibly work this day
+        # (available + have at least one valid block covering this day)
+        can_work = 0
+        for e, emp in enumerate(employees):
+            if not emp.availability[d]:
+                continue
+            # Check if any block of their preferred sizes covers day d
+            has_block = False
+            for s in emp.block_preferences:
+                for start in range(max(0, d - s + 1), d + 1):
+                    end = start + s
+                    if end <= days_in_month:
+                        if all(emp.availability[dd] for dd in range(start, end)):
+                            has_block = True
+                            break
+                if has_block:
+                    break
+            # Also check 8-block
+            if not has_block and emp.wants_8_block:
+                for start in range(days_in_month):
+                    if start + 9 <= days_in_month:
+                        work_days = list(range(start, start+4)) + list(range(start+5, start+9))
+                        if d in work_days and all(emp.availability[dd] for dd in work_days):
+                            has_block = True
+                            break
+            if has_block:
+                can_work += 1
+
+        if can_work < req.minimum:
+            issues.append(
+                f"⚠️ Unterbesetzung wahrscheinlich an {get_day_label(day, month, year)}: "
+                f"nur {can_work} Mitarbeiter können diesen Tag (inkl. Blockregeln) besetzen, "
+                f"{req.minimum} benötigt."
+            )
+
+        # Fachkraft check
+        fk_can_work = sum(
+            1 for e in fachkraft_indices
+            if employees[e].availability[d]
+        )
+        if fk_can_work == 0:
+            issues.append(
+                f"⚠️ Keine Fachkraft verfügbar an {get_day_label(day, month, year)} – "
+                f"Fachkraft-Regel kann nicht erfüllt werden."
+            )
+
+    # Min-services reachability per employee
+    for emp in employees:
+        avail_count = sum(emp.availability)
+        if avail_count < emp.min_services:
+            issues.append(
+                f"⚠️ {emp.name}: nur {avail_count} verfügbare Tage, "
+                f"aber Min-Dienste = {emp.min_services} – nicht erreichbar."
+            )
+
+    return issues
+
+
 def generate_schedule(
     employees: List[Employee],
     month: int,
@@ -338,68 +508,67 @@ def generate_schedule(
 ) -> Tuple[List[List[int]], List[str], List[Employee]]:
     """
     Builds a shift schedule using OR-Tools CP-SAT.
-    All rules are strictly enforced. No relaxation.
-    If no solution is possible, a clear error is returned with diagnostics.
+
+    Hard constraints (never violated, always respected):
+      - Availability
+      - Block structure (only allowed block sizes, exact 8-block pattern)
+      - Max 4 consecutive work days
+      - Min / Max services per employee
+
+    Soft constraints (maximised, but plan always produced):
+      - Daily minimum staffing (2 weekday / 3 weekend)
+      - At least 1 Fachkraft per day
+      - 3rd person on weekdays
+
+    Pre-solve diagnostics warn about days that cannot be fully covered.
+    The plan is always returned even if some days are under-staffed.
     """
     warnings: List[str] = []
     n = len(employees)
     D = days_in_month
     assignments_by_day: List[List[int]] = [[] for _ in range(D)]
 
+    # ── Pre-solve diagnostics ─────────────────────────────────────────────
+    diag_issues = _pre_solve_diagnostics(employees, month, year, D)
+    warnings.extend(diag_issues)
+
+    # ── Build and solve ───────────────────────────────────────────────────
     model, shift = _build_model(employees, month, year, D)
     status, solver = _solve(model, shift, employees, D)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        # This should now be extremely rare since daily coverage is soft
         warnings.append(
-            "❌ Kein gültiger Plan möglich – alle Regeln werden strikt eingehalten "
-            "und konnten nicht gleichzeitig erfüllt werden."
+            "❌ Solver konnte keinen Plan erstellen. "
+            "Bitte prüfe ob Min/Max-Dienste mit den verfügbaren Tagen erreichbar sind."
         )
-        # Diagnose: welche Tage haben zu wenig verfügbare Mitarbeiter?
-        fachkraft_indices = [e for e, emp in enumerate(employees) if emp.is_fachkraft]
-        for d in range(D):
-            day = d + 1
-            req = requirement_for_day(day, month, year)
-            avail = sum(1 for emp in employees if emp.availability[d])
-            avail_fk = sum(1 for e in fachkraft_indices if employees[e].availability[d])
-            if avail < req.minimum:
-                warnings.append(
-                    f"Unterbesetzung {get_day_label(day, month, year)}: "
-                    f"nur {avail} verfügbar, {req.minimum} benötigt."
-                )
-            if avail_fk == 0:
-                warnings.append(
-                    f"Keine Fachkraft verfügbar an {get_day_label(day, month, year)}."
-                )
-        for e, emp in enumerate(employees):
-            avail_count = sum(emp.availability)
-            if avail_count < emp.min_services:
-                warnings.append(
-                    f"Min-Dienste nicht erreichbar: {emp.name} hat nur {avail_count} "
-                    f"verfügbare Tage, benötigt {emp.min_services}."
-                )
         return assignments_by_day, warnings, employees
 
-    # ── Ergebnis auslesen ─────────────────────────────────────────────────
+    # ── Read solution ─────────────────────────────────────────────────────
     for d in range(D):
         for e in range(n):
             if solver.Value(shift[e][d]) == 1:
                 assignments_by_day[d].append(e)
                 employees[e].assigned_count += 1
 
-    # ── Post-solve Warnungen ──────────────────────────────────────────────
+    # ── Post-solve warnings ───────────────────────────────────────────────
     fachkraft_indices = [e for e, emp in enumerate(employees) if emp.is_fachkraft]
     for d in range(D):
         day = d + 1
         req = requirement_for_day(day, month, year)
         assigned = assignments_by_day[d]
+
         if len(assigned) < req.minimum:
             warnings.append(
                 f"Unterbesetzung {get_day_label(day, month, year)}: "
-                f"{len(assigned)} statt mindestens {req.minimum}."
+                f"{len(assigned)} statt mindestens {req.minimum} Personen."
             )
+
         fk_count = sum(1 for e in assigned if employees[e].is_fachkraft)
         if fk_count == 0 and req.needs_fachkraft:
-            warnings.append(f"Keine Fachkraft an {get_day_label(day, month, year)}.")
+            warnings.append(
+                f"Keine Fachkraft an {get_day_label(day, month, year)}."
+            )
 
     for e, emp in enumerate(employees):
         if emp.assigned_count < emp.min_services:
@@ -852,16 +1021,28 @@ if admin_mode:
         else:
             st.write("✅ Alle Tage haben ausreichend verfügbare Mitarbeiter.")
 
-        # Zusammenfassung der Diagnose – nur Info, kein Blockieren
+        # 4) Block-Erreichbarkeit prüfen
+        st.markdown("**Block-Erreichbarkeit (können Min-Dienste mit den Blöcken erreicht werden?):**")
+        block_errors = check_block_feasibility(
+            employees_for_plan, int(month), int(year), days_in_month
+        )
+        if block_errors:
+            for err in block_errors:
+                st.error(f"❌ {err}")
+            pre_check_errors.extend(block_errors)
+        else:
+            st.write("✅ Alle Mitarbeiter können ihre Min-Dienste mit ihren Blöcken erreichen.")
+
+        # Zusammenfassung
         if pre_check_errors:
-            st.warning(
-                "⚠️ Einige Mitarbeiter haben Probleme (siehe oben). "
-                "Der Plan wird trotzdem erstellt – betroffene Mitarbeiter erhalten 0 Dienste."
+            st.error(
+                "🚫 **Planung blockiert:** Bitte die rot markierten Probleme beheben. "
+                "Der Plan kann so nicht erstellt werden."
             )
         elif pre_check_warnings_list:
             st.warning(
-                "⚠️ Bei einigen Mitarbeitern könnten Min-Dienste nicht erreichbar sein. "
-                "Der Plan wird trotzdem erstellt."
+                "⚠️ Es gibt Warnungen – der Plan wird trotzdem versucht, "
+                "aber manche Min-Dienste könnten unterschritten werden."
             )
         else:
             st.success("✅ Alle Prüfungen bestanden – Planung kann starten.")
@@ -878,7 +1059,7 @@ if admin_mode:
 
         st.markdown("---")
 
-        if st.button("Dienstplan erstellen"):
+        if st.button("Dienstplan erstellen", disabled=bool(pre_check_errors)):
             with st.spinner("Dienstplan wird berechnet (OR-Tools CP-SAT)..."):
                 assignments_by_day, warnings, final_employees = generate_schedule(
                     employees_for_plan,
