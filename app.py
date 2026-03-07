@@ -391,30 +391,32 @@ def _build_model(
             fk_missing.append(None)
 
     # ── Objective ────────────────────────────────────────────────────────
+    # Priority 1 (highest): Tagesbesetzung einhalten → Strafe -1000 pro fehlender Person
+    # Priority 2: Fachkraft pro Tag → Strafe -1000 wenn keine FK
+    # Priority 3 (lowest): 3. Person an Wochentagen → Belohnung +1
+    #
+    # WICHTIG: Wir belohnen NIE einfach "mehr Dienste" für einen Mitarbeiter,
+    # da das den Solver dazu bringen könnte, Max-Dienste zu ignorieren.
+    # Min/Max sind bereits als harte Constraints gesetzt (Zeilen ~351-352).
     objective_terms = []
 
-    # Heavily penalise staffing shortfalls (hard-like behaviour)
+    # Strafe für Unterbesetzung pro Tag
     for sf in shortfall_day:
         objective_terms.append(-1000 * sf)
 
-    # Heavily penalise missing Fachkraft
+    # Strafe für fehlende Fachkraft pro Tag
     for fkm in fk_missing:
         if fkm is not None:
             objective_terms.append(-1000 * fkm)
 
-    # Reward 3rd person on weekdays (soft, low weight)
+    # Belohnung für 3. Person an Wochentagen (soft, niedrige Gewichtung)
+    # Durch Max-3-Constraint und Max-Dienste-Constraint kann dies nie
+    # die harten Grenzen überschreiten.
     for d in range(D):
         req = requirement_for_day(d + 1, month, year)
         if not req.exact_target:
-            for e in range(n):
-                objective_terms.append(shift[e][d])
-
-    # Penalise shortfall vs min_services per employee
-    for e, emp in enumerate(employees):
-        total = sum(shift[e][d] for d in range(D))
-        emp_sf = model.NewIntVar(0, emp.min_services, f"emp_sf_e{e}")
-        model.Add(emp_sf >= emp.min_services - total)
-        objective_terms.append(-10 * emp_sf)
+            daily_total = sum(shift[e][d] for e in range(n))
+            objective_terms.append(daily_total)
 
     model.Maximize(sum(objective_terms))
     return model, shift
