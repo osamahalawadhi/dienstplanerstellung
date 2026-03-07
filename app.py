@@ -203,25 +203,25 @@ def _build_model(
     month: int,
     year: int,
     days_in_month: int,
-    relax_min_services: bool = False,
-    weekday_min_override: Optional[Dict[int, int]] = None,   # day_0 → min
-    weekend_min_override: Optional[Dict[int, int]] = None,   # day_0 → min
-    relax_fachkraft_days: Optional[set] = None,              # day_0-indexed
 ) -> Tuple[cp_model.CpModel, List[List]]:
     """
-    Builds the CP-SAT model.
-    Relaxation flags allow progressive loosening when no solution exists.
+    Builds the CP-SAT model with ALL rules strictly enforced – no relaxation.
+
+    Hard constraints (always):
+      - Availability
+      - Block structure (only allowed block sizes)
+      - 8-block: exactly 4-off-4
+      - Max 4 consecutive work days, then at least 1 free
+      - Min AND Max services per employee
+      - Weekday: min 2 staff, at least 1 Fachkraft
+      - Weekend (Fr/Sa/So): min 3 staff, at least 1 Fachkraft
+
+    Soft (objective):
+      - 3rd person on weekdays to reach desired service counts
     """
     n = len(employees)
     D = days_in_month
     model = cp_model.CpModel()
-
-    if weekday_min_override is None:
-        weekday_min_override = {}
-    if weekend_min_override is None:
-        weekend_min_override = {}
-    if relax_fachkraft_days is None:
-        relax_fachkraft_days = set()
 
     # ── Decision variables ────────────────────────────────────────────────
     shift: List[List] = [
@@ -236,93 +236,56 @@ def _build_model(
                 model.Add(shift[e][d] == 0)
 
     # ── Block structure ───────────────────────────────────────────────────
-    # Strategy:
-    #   - For each employee, create block_start[d,s] = 1 if a block of
-    #     size s starts on day d.
-    #   - Enforce: shift[e][d] == sum of all block_start vars that cover d
-    #     (exactly 1 active block covers each worked day, 0 for free days).
-    #   - Blocks must not overlap: enforced implicitly because shift[e][d]
-    #     can only be 0 or 1, and each worked day is covered by exactly 1.
-    #   - 8-blocks handled separately with their own indicator vars.
-
     for e, emp in enumerate(employees):
         allowed_sizes = set(emp.block_preferences)
 
-        # block_start[(d,s)] = 1 means: employee e starts a block of
-        # size s on day d (0-indexed). Only created when block fits in month
-        # and all days in block are potentially available.
-        block_start: Dict[Tuple[int,int], object] = {}
+        block_start: Dict[Tuple[int, int], object] = {}
         for d in range(D):
             for s in allowed_sizes:
                 if d + s <= D:
-                    # Only create var if all days in block are available
-                    days_in_block = range(d, d + s)
-                    if all(emp.availability[dd] for dd in days_in_block):
+                    if all(emp.availability[dd] for dd in range(d, d + s)):
                         block_start[(d, s)] = model.NewBoolVar(f"bs_e{e}_d{d}_s{s}")
 
-        # 8-block vars: covers days d..d+3 (work), d+4 (free), d+5..d+8 (work)
         eight_block_vars: List[Tuple[int, object]] = []
         if emp.wants_8_block:
             for d in range(D):
                 if d + 9 <= D:
-                    work_days_8 = list(range(d, d+4)) + list(range(d+5, d+9))
-                    # Only if all work days are available
+                    work_days_8 = list(range(d, d + 4)) + list(range(d + 5, d + 9))
                     if all(emp.availability[dd] for dd in work_days_8):
                         eight_block_vars.append((d, model.NewBoolVar(f"8blk_e{e}_d{d}")))
 
-        # For each day: shift[e][d] == sum of all block vars covering that day
-        # Since shift is Bool (0 or 1), this means exactly 0 or 1 block covers it.
         for d in range(D):
             covering = []
-
-            # Normal blocks covering day d
             for s in allowed_sizes:
                 for start in range(max(0, d - s + 1), d + 1):
                     if (start, s) in block_start and start + s > d:
                         covering.append(block_start[(start, s)])
-
-            # 8-blocks covering day d (only work days count)
             for (bd, bvar) in eight_block_vars:
-                work_days_in_8 = list(range(bd, bd+4)) + list(range(bd+5, bd+9))
+                work_days_in_8 = list(range(bd, bd + 4)) + list(range(bd + 5, bd + 9))
                 if d in work_days_in_8:
                     covering.append(bvar)
 
             if covering:
-                # shift[e][d] = 1 iff exactly one covering block is active
-                # Using linear equality: shift[e][d] == sum(covering)
-                # (sum can only be 0 or 1 since blocks must not overlap)
                 model.Add(shift[e][d] == sum(covering))
             else:
-                # No valid block can cover this day
                 model.Add(shift[e][d] == 0)
 
-        # 8-block: enforce free day and that work days are linked to shift
+        # 8-block: free day must be free
         for (bd, bvar) in eight_block_vars:
-            free_day = bd + 4
-            # Free day must be 0 when 8-block active
-            model.Add(shift[e][free_day] == 0).OnlyEnforceIf(bvar)
-
-        # Blocks of same size cannot overlap:
-        # Two blocks of size s starting at d1 and d2 overlap if |d1-d2| < s
-        # Enforced implicitly: since shift[e][d] = sum(covering) and shift <= 1,
-        # at most one block can cover any given day → no overlaps possible.
-
-        # Additionally: a normal block and an 8-block cannot both cover the same day
-        # Also enforced by the shift == sum(covering) constraint above.
+            model.Add(shift[e][bd + 4] == 0).OnlyEnforceIf(bvar)
 
     # ── Max 4 consecutive work days ───────────────────────────────────────
     for e in range(n):
         for d in range(D - 4):
             model.Add(sum(shift[e][d + k] for k in range(5)) <= 4)
 
-    # ── Min / Max services ────────────────────────────────────────────────
+    # ── Min / Max services – both strictly enforced ───────────────────────
     for e, emp in enumerate(employees):
         total = sum(shift[e][d] for d in range(D))
-        if not relax_min_services:
-            model.Add(total >= emp.min_services)
+        model.Add(total >= emp.min_services)
         model.Add(total <= emp.max_services)
 
-    # ── Daily coverage ────────────────────────────────────────────────────
+    # ── Daily coverage – strictly enforced ───────────────────────────────
     fachkraft_indices = [e for e, emp in enumerate(employees) if emp.is_fachkraft]
 
     for d in range(D):
@@ -330,22 +293,15 @@ def _build_model(
         req = requirement_for_day(day, month, year)
         daily_total = sum(shift[e][d] for e in range(n))
 
-        # Minimum staffing
-        if req.exact_target:
-            min_today = weekend_min_override.get(d, req.minimum)
-        else:
-            min_today = weekday_min_override.get(d, req.minimum)
+        # Minimum staffing – always hard
+        model.Add(daily_total >= req.minimum)
 
-        model.Add(daily_total >= min_today)
+        # Fachkraft – always hard
+        available_fk_today = [e for e in fachkraft_indices if employees[e].availability[d]]
+        if available_fk_today:
+            model.Add(sum(shift[e][d] for e in available_fk_today) >= 1)
 
-        # Fachkraft constraint (skip if relaxed for this day)
-        if d not in relax_fachkraft_days:
-            available_fk_today = [e for e in fachkraft_indices if employees[e].availability[d]]
-            if available_fk_today:
-                fk_sum = sum(shift[e][d] for e in available_fk_today)
-                model.Add(fk_sum >= 1)
-
-    # ── Objective ────────────────────────────────────────────────────────
+    # ── Objective: fill up toward targets ────────────────────────────────
     objective_terms = []
 
     # Reward 3rd person on weekdays (soft)
@@ -355,7 +311,7 @@ def _build_model(
             for e in range(n):
                 objective_terms.append(shift[e][d])
 
-    # Penalise shortfall vs min_services
+    # Reward reaching min_services
     for e, emp in enumerate(employees):
         total = sum(shift[e][d] for d in range(D))
         shortfall = model.NewIntVar(0, emp.min_services, f"shortfall_e{e}")
@@ -363,7 +319,6 @@ def _build_model(
         objective_terms.append(-10 * shortfall)
 
     model.Maximize(sum(objective_terms))
-
     return model, shift
 
 
@@ -382,172 +337,47 @@ def generate_schedule(
     days_in_month: int,
 ) -> Tuple[List[List[int]], List[str], List[Employee]]:
     """
-    Builds a shift schedule using OR-Tools CP-SAT with multi-stage relaxation.
-
-    Relaxation stages (applied only if previous stage yields no solution):
-      Stage 1 – All rules strict
-      Stage 2 – Min-services per employee relaxed
-      Stage 3 – Weekday minimum reduced to 1
-      Stage 4 – Weekend minimum reduced to 2
-      Stage 5 – No solution possible → clear error message
+    Builds a shift schedule using OR-Tools CP-SAT.
+    All rules are strictly enforced. No relaxation.
+    If no solution is possible, a clear error is returned with diagnostics.
     """
     warnings: List[str] = []
     n = len(employees)
     D = days_in_month
-
-    fachkraft_indices = [e for e, emp in enumerate(employees) if emp.is_fachkraft]
-
-    # Pre-compute days where no Fachkraft is available at all → always relaxed
-    always_relax_fk: set = set()
-    for d in range(D):
-        available_fk = [e for e in fachkraft_indices if employees[e].availability[d]]
-        if not available_fk:
-            always_relax_fk.add(d)
-            warnings.append(
-                f"Keine Fachkraft verfügbar an {get_day_label(d + 1, month, year)} – "
-                f"Fachkraft-Regel wird für diesen Tag gelockert."
-            )
-
     assignments_by_day: List[List[int]] = [[] for _ in range(D)]
 
-    # ── Stage 1: Alles strikt ─────────────────────────────────────────────
-    model, shift = _build_model(
-        employees, month, year, D,
-        relax_fachkraft_days=always_relax_fk,
-    )
+    model, shift = _build_model(employees, month, year, D)
     status, solver = _solve(model, shift, employees, D)
 
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        warnings.append("✅ Stufe 1: Plan erfolgreich mit allen Regeln erstellt.")
-    else:
-        # ── Stage 2: Min-Dienste lockern ──────────────────────────────────
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         warnings.append(
-            "⚠️ Stufe 1 fehlgeschlagen – Min-Dienste werden gelockert."
+            "❌ Kein gültiger Plan möglich – alle Regeln werden strikt eingehalten "
+            "und konnten nicht gleichzeitig erfüllt werden."
         )
-        model, shift = _build_model(
-            employees, month, year, D,
-            relax_min_services=True,
-            relax_fachkraft_days=always_relax_fk,
-        )
-        status, solver = _solve(model, shift, employees, D)
-
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            warnings.append("✅ Stufe 2: Plan erstellt – Min-Dienste einzelner Mitarbeiter ggf. unterschritten.")
-        else:
-            # ── Stage 3: Wochentag-Minimum auf 1 ─────────────────────────
-            warnings.append(
-                "⚠️ Stufe 2 fehlgeschlagen – Wochentag-Minimum wird auf 1 reduziert."
-            )
-            # Find which weekdays are problematic (fewer than 2 available)
-            weekday_min_override = {}
-            for d in range(D):
-                req = requirement_for_day(d + 1, month, year)
-                if not req.exact_target:
-                    available_count = sum(1 for e in range(n) if employees[e].availability[d])
-                    if available_count < req.minimum:
-                        weekday_min_override[d] = max(1, available_count)
-                        warnings.append(
-                            f"Wochentag {get_day_label(d + 1, month, year)}: "
-                            f"nur {available_count} verfügbar – Minimum auf {max(1, available_count)} reduziert."
-                        )
-
-            model, shift = _build_model(
-                employees, month, year, D,
-                relax_min_services=True,
-                weekday_min_override=weekday_min_override,
-                relax_fachkraft_days=always_relax_fk,
-            )
-            status, solver = _solve(model, shift, employees, D)
-
-            if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                warnings.append("✅ Stufe 3: Plan erstellt – Wochentage ggf. unterbesetzt.")
-            else:
-                # ── Stage 4: Wochenend-Minimum auf 2 ─────────────────────
+        # Diagnose: welche Tage haben zu wenig verfügbare Mitarbeiter?
+        fachkraft_indices = [e for e, emp in enumerate(employees) if emp.is_fachkraft]
+        for d in range(D):
+            day = d + 1
+            req = requirement_for_day(day, month, year)
+            avail = sum(1 for emp in employees if emp.availability[d])
+            avail_fk = sum(1 for e in fachkraft_indices if employees[e].availability[d])
+            if avail < req.minimum:
                 warnings.append(
-                    "⚠️ Stufe 3 fehlgeschlagen – Wochenend-Minimum wird auf 2 reduziert."
+                    f"Unterbesetzung {get_day_label(day, month, year)}: "
+                    f"nur {avail} verfügbar, {req.minimum} benötigt."
                 )
-                weekend_min_override = {}
-                for d in range(D):
-                    req = requirement_for_day(d + 1, month, year)
-                    if req.exact_target:
-                        available_count = sum(1 for e in range(n) if employees[e].availability[d])
-                        if available_count < req.minimum:
-                            weekend_min_override[d] = max(2, available_count)
-                            warnings.append(
-                                f"Wochenende {get_day_label(d + 1, month, year)}: "
-                                f"nur {available_count} verfügbar – Minimum auf {max(2, available_count)} reduziert."
-                            )
-
-                model, shift = _build_model(
-                    employees, month, year, D,
-                    relax_min_services=True,
-                    weekday_min_override=weekday_min_override,
-                    weekend_min_override=weekend_min_override,
-                    relax_fachkraft_days=always_relax_fk,
+            if avail_fk == 0:
+                warnings.append(
+                    f"Keine Fachkraft verfügbar an {get_day_label(day, month, year)}."
                 )
-                status, solver = _solve(model, shift, employees, D)
-
-                if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    warnings.append("✅ Stufe 4: Plan erstellt – Wochenenden ggf. unterbesetzt.")
-                else:
-                    # ── Stage 5: Alle Tagesminima komplett entfernen ──────
-                    # Plan wird trotzdem erstellt – nur Blockregeln + Max bleiben hart.
-                    warnings.append(
-                        "⚠️ Stufe 5: Tagesminima werden vollständig entfernt – "
-                        "Plan wird mit verfügbaren Mitarbeitern bestmöglich befüllt."
-                    )
-                    # Override alle Tage auf Minimum 0
-                    weekday_min_override_5 = {d: 0 for d in range(D)}
-                    weekend_min_override_5 = {d: 0 for d in range(D)}
-
-                    model, shift = _build_model(
-                        employees, month, year, D,
-                        relax_min_services=True,
-                        weekday_min_override=weekday_min_override_5,
-                        weekend_min_override=weekend_min_override_5,
-                        relax_fachkraft_days=set(range(D)),  # alle Tage FK-frei
-                    )
-                    status, solver = _solve(model, shift, employees, D)
-
-                    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                        warnings.append(
-                            "✅ Stufe 5: Notfallplan erstellt – bitte Warnungen prüfen. "
-                            "Viele Tage sind möglicherweise unterbesetzt."
-                        )
-                    else:
-                        # Absoluter Notfall: nur Verfügbarkeit + Max, keine anderen Constraints
-                        warnings.append(
-                            "⚠️ Stufe 6: Minimaler Notfallplan – nur Verfügbarkeit und Max-Dienste werden beachtet."
-                        )
-                        model6 = cp_model.CpModel()
-                        shift6 = [
-                            [model6.NewBoolVar(f"s6_e{e}_d{d}") for d in range(D)]
-                            for e in range(n)
-                        ]
-                        # Nur Verfügbarkeit und Max
-                        for e, emp in enumerate(employees):
-                            for d in range(D):
-                                if not emp.availability[d]:
-                                    model6.Add(shift6[e][d] == 0)
-                            model6.Add(sum(shift6[e][d] for d in range(D)) <= emp.max_services)
-                        # Maximiere Besetzung
-                        model6.Maximize(sum(shift6[e][d] for e in range(n) for d in range(D)))
-                        solver6 = cp_model.CpSolver()
-                        solver6.parameters.max_time_in_seconds = 10.0
-                        status6 = solver6.Solve(model6)
-                        if status6 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                            shift = shift6
-                            solver = solver6
-                            warnings.append(
-                                "✅ Stufe 6: Notfallplan erstellt – Blockregeln konnten nicht eingehalten werden. "
-                                "Bitte Verfügbarkeiten und Blockpräferenzen der Mitarbeiter prüfen."
-                            )
-                        else:
-                            warnings.append(
-                                "❌ Kein Plan möglich – alle Mitarbeiter haben 0 verfügbare Tage. "
-                                "Bitte Verfügbarkeiten eintragen."
-                            )
-                            return assignments_by_day, warnings, employees
+        for e, emp in enumerate(employees):
+            avail_count = sum(emp.availability)
+            if avail_count < emp.min_services:
+                warnings.append(
+                    f"Min-Dienste nicht erreichbar: {emp.name} hat nur {avail_count} "
+                    f"verfügbare Tage, benötigt {emp.min_services}."
+                )
+        return assignments_by_day, warnings, employees
 
     # ── Ergebnis auslesen ─────────────────────────────────────────────────
     for d in range(D):
@@ -557,22 +387,19 @@ def generate_schedule(
                 employees[e].assigned_count += 1
 
     # ── Post-solve Warnungen ──────────────────────────────────────────────
+    fachkraft_indices = [e for e, emp in enumerate(employees) if emp.is_fachkraft]
     for d in range(D):
         day = d + 1
         req = requirement_for_day(day, month, year)
         assigned = assignments_by_day[d]
-
         if len(assigned) < req.minimum:
             warnings.append(
                 f"Unterbesetzung {get_day_label(day, month, year)}: "
                 f"{len(assigned)} statt mindestens {req.minimum}."
             )
-
         fk_count = sum(1 for e in assigned if employees[e].is_fachkraft)
-        if fk_count == 0 and req.needs_fachkraft and d not in always_relax_fk:
-            warnings.append(
-                f"Keine Fachkraft an {get_day_label(day, month, year)}."
-            )
+        if fk_count == 0 and req.needs_fachkraft:
+            warnings.append(f"Keine Fachkraft an {get_day_label(day, month, year)}.")
 
     for e, emp in enumerate(employees):
         if emp.assigned_count < emp.min_services:
