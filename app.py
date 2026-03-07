@@ -898,6 +898,86 @@ if admin_mode:
                 f"Blöcke: {sorted(emp.block_preferences)} | 8er: {'Ja' if emp.wants_8_block else 'Nein'}"
             )
 
+        # ── Diagnose vor der Planung ──────────────────────────────────────
+        st.markdown("### Diagnose vor der Planung")
+        pre_check_errors = []
+        pre_check_warnings_list = []
+
+        # 1) Verfügbarkeit pro Mitarbeiter
+        st.markdown("**Verfügbarkeit pro Mitarbeiter:**")
+        for emp in employees_for_plan:
+            avail_count = sum(emp.availability)
+            avail_pct = int(avail_count / days_in_month * 100)
+            if avail_count == 0:
+                st.error(
+                    f"❌ **{emp.name}**: 0 von {days_in_month} Tagen verfügbar – "
+                    f"Verfügbarkeit wurde nicht eingetragen!"
+                )
+                pre_check_errors.append(emp.name)
+            elif avail_count < emp.min_services:
+                st.warning(
+                    f"⚠️ **{emp.name}**: nur {avail_count} Tage verfügbar, "
+                    f"aber Min-Dienste = {emp.min_services} – Min möglicherweise nicht erreichbar."
+                )
+                pre_check_warnings_list.append(emp.name)
+            else:
+                st.write(
+                    f"✅ **{emp.name}**: {avail_count} von {days_in_month} Tagen verfügbar ({avail_pct}%)"
+                )
+
+        # 2) Gesamtkapazität prüfen
+        st.markdown("**Gesamtkapazität:**")
+        total_max = sum(emp.max_services for emp in employees_for_plan)
+        total_min_needed = sum(
+            requirement_for_day(d + 1, int(month), int(year)).minimum
+            for d in range(days_in_month)
+        )
+        if total_max < total_min_needed:
+            st.error(
+                f"❌ Gesamte Max-Dienste ({total_max}) reichen nicht für "
+                f"den Mindestbedarf des Monats ({total_min_needed} benötigt)."
+            )
+            pre_check_errors.append("Gesamtkapazität")
+        else:
+            st.write(
+                f"✅ Kapazität ausreichend: {total_max} Max-Dienste verfügbar, "
+                f"{total_min_needed} Dienste mindestens benötigt."
+            )
+
+        # 3) Kritische Tage
+        st.markdown("**Kritische Tage (zu wenig verfügbare Mitarbeiter):**")
+        critical_days = []
+        for d in range(days_in_month):
+            available_today = sum(1 for emp in employees_for_plan if emp.availability[d])
+            req = requirement_for_day(d + 1, int(month), int(year))
+            if available_today < req.minimum:
+                critical_days.append((d + 1, available_today, req.minimum))
+
+        if critical_days:
+            for day, avail, needed in critical_days:
+                st.warning(
+                    f"⚠️ {get_day_label(day, int(month), int(year))}: "
+                    f"nur {avail} verfügbar, {needed} benötigt."
+                )
+        else:
+            st.write("✅ Alle Tage haben ausreichend verfügbare Mitarbeiter.")
+
+        # Blockierung bei kritischen Fehlern
+        if pre_check_errors:
+            st.error(
+                "🚫 **Planung blockiert:** Bitte zuerst die rot markierten Probleme beheben. "
+                "Mitarbeiter ohne Verfügbarkeit müssen ihre Daten zuerst eintragen."
+            )
+        elif pre_check_warnings_list:
+            st.warning(
+                "⚠️ Es gibt Warnungen – der Plan wird trotzdem versucht, "
+                "aber manche Min-Dienste könnten unterschritten werden."
+            )
+        else:
+            st.success("✅ Alle Prüfungen bestanden – Planung kann starten.")
+
+        st.markdown("---")
+
         overview_excel = build_input_overview_excel(employees_for_plan, int(month), int(year), days_in_month)
         st.download_button(
             label="Eingaben als Kontroll-Excel herunterladen",
@@ -907,40 +987,44 @@ if admin_mode:
         )
 
         st.markdown("---")
-        if st.button("Dienstplan erstellen"):
-            with st.spinner("Dienstplan wird berechnet (OR-Tools CP-SAT)..."):
-                assignments_by_day, warnings, final_employees = generate_schedule(
-                    employees_for_plan,
-                    int(month),
-                    int(year),
-                    days_in_month,
+
+        if not pre_check_errors:
+            if st.button("Dienstplan erstellen"):
+                with st.spinner("Dienstplan wird berechnet (OR-Tools CP-SAT)..."):
+                    assignments_by_day, warnings, final_employees = generate_schedule(
+                        employees_for_plan,
+                        int(month),
+                        int(year),
+                        days_in_month,
+                    )
+
+                schedule_excel = build_schedule_excel(
+                    original_employees=employees_for_plan,
+                    final_employees=final_employees,
+                    assignments_by_day=assignments_by_day,
+                    warnings=warnings,
+                    month=int(month),
+                    year=int(year),
+                    days_in_month=days_in_month,
                 )
 
-            schedule_excel = build_schedule_excel(
-                original_employees=employees_for_plan,
-                final_employees=final_employees,
-                assignments_by_day=assignments_by_day,
-                warnings=warnings,
-                month=int(month),
-                year=int(year),
-                days_in_month=days_in_month,
-            )
+                important_warnings = filter_user_warnings(warnings)
+                st.success("Dienstplan wurde erstellt.")
 
-            important_warnings = filter_user_warnings(warnings)
-            st.success("Dienstplan wurde erstellt.")
+                st.download_button(
+                    label="Dienstplan als Excel herunterladen",
+                    data=schedule_excel,
+                    file_name=f"dienstplan_{int(month):02d}_{int(year)}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
-            st.download_button(
-                label="Dienstplan als Excel herunterladen",
-                data=schedule_excel,
-                file_name=f"dienstplan_{int(month):02d}_{int(year)}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-            st.subheader("Warnungen")
-            if important_warnings:
-                for warning in important_warnings:
-                    st.warning(warning)
-            else:
-                st.info("Keine wichtigen Warnungen.")
+                st.subheader("Warnungen")
+                if important_warnings:
+                    for warning in important_warnings:
+                        st.warning(warning)
+                else:
+                    st.info("Keine wichtigen Warnungen.")
+        else:
+            st.button("Dienstplan erstellen", disabled=True)
     else:
         st.warning("Noch keine vollständigen Mitarbeitereingaben vorhanden.")
