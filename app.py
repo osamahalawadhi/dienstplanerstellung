@@ -269,6 +269,7 @@ def _build_model(
     month: int,
     year: int,
     days_in_month: int,
+    strategy: int = 1,
 ) -> Tuple[cp_model.CpModel, List[List]]:
     """
     Builds the CP-SAT model with ALL rules strictly enforced – no relaxation.
@@ -451,32 +452,85 @@ def _build_model(
             fk_missing.append(None)
 
     # ── Objective ────────────────────────────────────────────────────────
-    # Priority 1 (highest): Tagesbesetzung einhalten → Strafe -1000 pro fehlender Person
-    # Priority 2: Fachkraft pro Tag → Strafe -1000 wenn keine FK
-    # Priority 3 (lowest): 3. Person an Wochentagen → Belohnung +1
+    # Basis-Strafe (immer): Unterbesetzung und fehlende Fachkraft
+    # Strategie beeinflusst zusätzliche Gewichtungen um echte
+    # unterschiedliche Lösungen zu erzwingen.
     #
-    # WICHTIG: Wir belohnen NIE einfach "mehr Dienste" für einen Mitarbeiter,
-    # da das den Solver dazu bringen könnte, Max-Dienste zu ignorieren.
-    # Min/Max sind bereits als harte Constraints gesetzt (Zeilen ~351-352).
+    # strategy=1: Gleichmäßige Verteilung – bevorzuge Mitarbeiter mit wenig Diensten
+    # strategy=2: Schwierige Tage zuerst – höhere Belohnung für Tage mit wenig Verfügbarkeit
+    # strategy=3: Fachkraft & Wochenende zuerst – maximiere FK-Abdeckung und Wochenendbesetzung
     objective_terms = []
 
-    # Strafe für Unterbesetzung pro Tag
+    # ── Basis: Strafe für Unterbesetzung (alle Strategien gleich) ─────────
     for sf in shortfall_day:
         objective_terms.append(-1000 * sf)
 
-    # Strafe für fehlende Fachkraft pro Tag
     for fkm in fk_missing:
         if fkm is not None:
             objective_terms.append(-1000 * fkm)
 
-    # Belohnung für 3. Person an Wochentagen (soft, niedrige Gewichtung)
-    # Durch Max-3-Constraint und Max-Dienste-Constraint kann dies nie
-    # die harten Grenzen überschreiten.
-    for d in range(D):
-        req = requirement_for_day(d + 1, month, year)
-        if not req.exact_target:
+    # ── Strategie-spezifische Gewichtungen ────────────────────────────────
+    if strategy == 1:
+        # Gleichmäßige Verteilung:
+        # Belohne Zuweisung an Mitarbeiter die noch wenig haben (relativ zu ihrem Min)
+        # → verteilt Dienste fairer über alle Mitarbeiter
+        for d in range(D):
+            for e, emp in enumerate(employees):
+                # Je weiter unter dem Min, desto mehr Belohnung für diesen Tag
+                gap = max(0, emp.min_services - 1)  # Proxy für "braucht noch Dienste"
+                objective_terms.append((1 + gap) * shift[e][d])
+
+        # Zusätzlich: bestrafe große Ungleichheit (Varianz-Proxy)
+        # Mitarbeiter die über ihrem Durchschnitt sind, bekommen weniger Belohnung
+        avg_min = sum(emp.min_services for emp in employees) // max(1, n)
+        for e, emp in enumerate(employees):
+            total = sum(shift[e][d] for d in range(D))
+            if emp.min_services > avg_min:
+                objective_terms.append(-2 * total)
+
+    elif strategy == 2:
+        # Schwierige Tage zuerst:
+        # Berechne für jeden Tag wie viele Mitarbeiter verfügbar sind
+        # Tage mit wenig Verfügbarkeit bekommen höhere Belohnung pro Person
+        for d in range(D):
+            available_count = sum(1 for emp in employees if emp.availability[d])
+            # Je weniger verfügbar, desto wertvoller ist jede Zuweisung
+            scarcity_weight = max(1, n - available_count + 1)
             daily_total = sum(shift[e][d] for e in range(n))
-            objective_terms.append(daily_total)
+            objective_terms.append(scarcity_weight * daily_total)
+
+        # Wochenenden extra priorisieren
+        for d in range(D):
+            req = requirement_for_day(d + 1, month, year)
+            if req.exact_target:
+                daily_total = sum(shift[e][d] for e in range(n))
+                objective_terms.append(50 * daily_total)
+
+    elif strategy == 3:
+        # Fachkraft & Wochenende maximieren:
+        # Fachkräfte bekommen viel höhere Belohnung → Solver setzt sie bevorzugt ein
+        # Wochenenden bekommen extra Gewicht
+        for d in range(D):
+            req = requirement_for_day(d + 1, month, year)
+            day_weight = 10 if req.exact_target else 3
+
+            for e, emp in enumerate(employees):
+                fk_bonus = 20 if emp.is_fachkraft else 0
+                objective_terms.append((day_weight + fk_bonus) * shift[e][d])
+
+        # Zusätzlich: belohne jeden Tag an dem eine Fachkraft eingeplant ist
+        for fkm in fk_missing:
+            if fkm is not None:
+                # Belohnung wenn Fachkraft vorhanden (= fkm ist 0)
+                objective_terms.append(-50 * fkm)  # Strafe wenn keine FK
+
+    else:
+        # Fallback: einfache Maximierung der Gesamtbesetzung
+        for d in range(D):
+            req = requirement_for_day(d + 1, month, year)
+            if not req.exact_target:
+                daily_total = sum(shift[e][d] for e in range(n))
+                objective_terms.append(daily_total)
 
     model.Maximize(sum(objective_terms))
     return model, shift
@@ -654,33 +708,45 @@ def generate_variants(
     num_variants: int = 3,
 ) -> List[Tuple[List[List[int]], List[str], List[Employee]]]:
     """
-    Generates multiple distinct valid schedule variants.
-    After each solution, we forbid that exact assignment so the next
-    solve must find a genuinely different distribution.
-    All hard constraints remain enforced for every variant.
+    Generates 3 schedule variants using different optimization strategies.
+
+    Variante 1 – Gleichmäßige Verteilung:
+        Verteilt Dienste fair über alle Mitarbeiter.
+        Mitarbeiter die noch weit von ihrem Min entfernt sind, werden bevorzugt.
+
+    Variante 2 – Schwierige Tage zuerst:
+        Tage mit wenig Verfügbarkeit werden priorisiert besetzt.
+        Wochenenden erhalten extra Gewicht.
+
+    Variante 3 – Fachkraft & Wochenende maximieren:
+        Fachkräfte werden bevorzugt eingesetzt.
+        Wochenenden werden zuerst optimal besetzt.
+
+    Alle Varianten halten ALLE harten Regeln ein.
     """
     import copy
+
+    STRATEGIES = {
+        1: "Gleichmäßige Verteilung",
+        2: "Schwierige Tage zuerst",
+        3: "Fachkraft & Wochenende maximieren",
+    }
 
     variants = []
     D = days_in_month
     n = len(employees)
 
     diag_issues = _pre_solve_diagnostics(employees, month, year, D)
-    previous_solutions: List[List[List[int]]] = []
 
     for variant_idx in range(num_variants):
+        strategy = variant_idx + 1
+        strategy_name = STRATEGIES.get(strategy, f"Strategie {strategy}")
+
         emps = copy.deepcopy(employees)
         warnings: List[str] = list(diag_issues)
         assignments_by_day: List[List[int]] = [[] for _ in range(D)]
 
-        model, shift = _build_model(emps, month, year, D)
-
-        # Forbid all previous exact solutions
-        for prev in previous_solutions:
-            worked = [(e, d) for d in range(D) for e in prev[d]]
-            if worked:
-                # Require at least one assignment to differ from previous solution
-                model.AddBoolOr([shift[e][d].Not() for (e, d) in worked])
+        model, shift = _build_model(emps, month, year, D, strategy=strategy)
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 30.0
@@ -689,11 +755,11 @@ def generate_variants(
 
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             warnings.append(
-                f"❌ Variante {variant_idx + 1} konnte nicht berechnet werden – "
-                f"keine weitere gültige Lösung gefunden."
+                f"❌ Variante {variant_idx + 1} ({strategy_name}) konnte nicht "
+                f"berechnet werden – keine gültige Lösung gefunden."
             )
             variants.append((assignments_by_day, warnings, emps))
-            break
+            continue
 
         for d in range(D):
             for e in range(n):
@@ -701,8 +767,7 @@ def generate_variants(
                     assignments_by_day[d].append(e)
                     emps[e].assigned_count += 1
 
-        previous_solutions.append(assignments_by_day)
-
+        # Post-solve warnings
         fachkraft_indices = [e for e, emp in enumerate(emps) if emp.is_fachkraft]
         for d in range(D):
             day = d + 1
@@ -1228,7 +1293,11 @@ if admin_mode:
             st.success(f"{num_found} Variante(n) berechnet.")
 
             # Varianten-Tabs
-            tab_labels = [f"Variante {i+1}" for i in range(num_found)]
+            tab_labels = [
+                "📊 Variante 1 – Gleichmäßige Verteilung",
+                "🎯 Variante 2 – Schwierige Tage zuerst",
+                "⭐ Variante 3 – Fachkraft & Wochenende",
+            ]
             tabs = st.tabs(tab_labels)
 
             for tab_idx, tab in enumerate(tabs):
