@@ -336,9 +336,69 @@ def _build_model(
             else:
                 model.Add(shift[e][d] == 0)
 
-        # 8-block: free day must be free
+        # ── Pflichtfreier Tag nach jedem Block ────────────────────────────
+        # Nach jedem Block muss mindestens 1 Tag frei sein.
+        # Tag VOR dem Block muss ebenfalls frei sein.
+        # Das verhindert dass zwei Blöcke direkt aneinander grenzen.
+        # Beispiel 2er: Tag1-2 arbeiten, Tag3-4 arbeiten → VERBOTEN
+        #               Tag1-2 arbeiten, Tag3 frei, Tag4-5 arbeiten → erlaubt
+        for (d, s), bvar in block_start.items():
+            # Tag direkt NACH dem Block muss frei sein
+            day_after = d + s
+            if day_after < D:
+                model.Add(shift[e][day_after] == 0).OnlyEnforceIf(bvar)
+            # Tag direkt VOR dem Block muss frei sein
+            day_before = d - 1
+            if day_before >= 0:
+                model.Add(shift[e][day_before] == 0).OnlyEnforceIf(bvar)
+
+        # Zwei Blöcke dürfen nicht direkt aneinander grenzen (Abstand mind. 1 Tag)
+        # d2 muss mindestens d1 + s1 + 1 sein
+        items = list(block_start.items())
+        for i in range(len(items)):
+            (d1, s1), bv1 = items[i]
+            for j in range(i + 1, len(items)):
+                (d2, s2), bv2 = items[j]
+                # Ensure d1 <= d2
+                if d1 > d2:
+                    d1, s1, bv1, d2, s2, bv2 = d2, s2, bv2, d1, s1, bv1
+                # Block2 starts before end of Block1 + mandatory rest day → forbidden
+                # d2 <= d1+s1 covers overlap AND direct adjacency (d2 == d1+s1)
+                if d2 <= d1 + s1:
+                    model.Add(bv1 + bv2 <= 1)
+
+        # Nach einem 8er-Block: Tag nach dem gesamten Block (d+9) muss frei sein
+        for (bd, bvar) in eight_block_vars:
+            day_after_8 = bd + 9
+            if day_after_8 < D:
+                model.Add(shift[e][day_after_8] == 0).OnlyEnforceIf(bvar)
+            # Tag vor dem 8er-Block muss frei sein
+            day_before_8 = bd - 1
+            if day_before_8 >= 0:
+                model.Add(shift[e][day_before_8] == 0).OnlyEnforceIf(bvar)
+
+        # Nach einem 8er-Block: Tag nach dem gesamten Block (d+9) muss frei sein
+        for (bd, bvar) in eight_block_vars:
+            day_after_8 = bd + 9
+            if day_after_8 < D:
+                model.Add(shift[e][day_after_8] == 0).OnlyEnforceIf(bvar)
+
+        # 8-block: interner freier Tag (bd+4) muss frei sein
         for (bd, bvar) in eight_block_vars:
             model.Add(shift[e][bd + 4] == 0).OnlyEnforceIf(bvar)
+
+        # ── 8-Block darf nicht mit normalen Blöcken überlappen/angrenzen ──
+        for (bd, bvar_8) in eight_block_vars:
+            for (d, s), bvar_n in block_start.items():
+                # 8-Block belegt Tage bd..bd+8 (inkl. freier Tag bd+4)
+                # + Pflichtpause bei bd+9
+                # Normaler Block darf nicht in diesem Bereich starten oder hineinragen
+                block_conflicts = (
+                    d <= bd + 9 and d + s > bd
+                )
+                if block_conflicts:
+                    model.Add(bvar_8 + bvar_n <= 1)
+
 
     # ── Max 4 consecutive work days ───────────────────────────────────────
     for e in range(n):
