@@ -13,6 +13,42 @@ from ortools.sat.python import cp_model
 
 GREEN_FILL = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
 
+# Availability levels: 100=yes, 50=maybe, 25=rather not, 0=no
+AVAIL_YES        = 100
+AVAIL_MAYBE      = 50
+AVAIL_RATHER_NOT = 25
+AVAIL_NO         = 0
+
+AVAIL_OPTIONS = {
+    "✅ Yes (100%)"       : AVAIL_YES,
+    "🟡 Maybe (50%)"     : AVAIL_MAYBE,
+    "🟠 Rather not (25%)": AVAIL_RATHER_NOT,
+    "❌ No (0%)"         : AVAIL_NO,
+}
+AVAIL_LABEL = {v: k for k, v in AVAIL_OPTIONS.items()}
+
+# Excel fill colours per availability level
+FILL_YES        = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")  # green
+FILL_MAYBE      = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")  # yellow
+FILL_RATHER_NOT = PatternFill(start_color="FFD580", end_color="FFD580", fill_type="solid")  # orange
+FILL_NO         = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")  # red
+
+AVAIL_FILL = {
+    AVAIL_YES:        FILL_YES,
+    AVAIL_MAYBE:      FILL_MAYBE,
+    AVAIL_RATHER_NOT: FILL_RATHER_NOT,
+    AVAIL_NO:         FILL_NO,
+}
+
+# Penalty weights added to the objective for soft-penalising reluctant days
+# (higher = solver avoids that day more strongly)
+AVAIL_PENALTY = {
+    AVAIL_YES:        0,    # no penalty – preferred
+    AVAIL_MAYBE:      50,   # slight penalty
+    AVAIL_RATHER_NOT: 300,  # strong penalty – only if necessary
+    AVAIL_NO:         None, # hard block – never assigned
+}
+
 
 # ─────────────────────────────────────────────
 # DATACLASSES
@@ -22,7 +58,7 @@ GREEN_FILL = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="so
 class Employee:
     name: str
     is_fachkraft: bool
-    availability: List[bool]       # length = days_in_month
+    availability: List[int]        # length = days_in_month; values: 100/50/25/0
     min_services: int
     max_services: int
     block_preferences: Set[int]    # e.g. {2, 3}
@@ -170,7 +206,7 @@ def build_employees_from_inputs(sb, planning_round_id: int, days_in_month: int) 
             continue
         availability = row.get("availability") or []
         if len(availability) != days_in_month:
-            availability = [False] * days_in_month
+            availability = [AVAIL_NO] * days_in_month
 
         blocks_raw = row.get("block_preferences") or []
         block_preferences = set()
@@ -185,7 +221,7 @@ def build_employees_from_inputs(sb, planning_round_id: int, days_in_month: int) 
         employees.append(Employee(
             name=row["name"],
             is_fachkraft=bool(row.get("is_fachkraft", False)),
-            availability=[bool(x) for x in availability],
+            availability=[int(x) if int(x) in (AVAIL_YES, AVAIL_MAYBE, AVAIL_RATHER_NOT, AVAIL_NO) else AVAIL_NO for x in availability],
             min_services=int(row.get("min_services", 0)),
             max_services=int(row.get("max_services", 0)),
             block_preferences=block_preferences,
@@ -220,7 +256,7 @@ def check_block_feasibility(
             for d in range(D):
                 if d + 9 <= D:
                     work_days = list(range(d, d+4)) + list(range(d+5, d+9))
-                    if all(emp.availability[dd] for dd in work_days):
+                    if all(emp.availability[dd] > AVAIL_NO for dd in work_days):
                         eight_possible = True
                         break
             if not eight_possible:
@@ -245,7 +281,7 @@ def check_block_feasibility(
             placed = False
             for s in sorted(allowed_sizes, reverse=True):
                 if d + s <= D:
-                    if all(emp.availability[dd] for dd in range(d, d + s)):
+                    if all(emp.availability[dd] > AVAIL_NO for dd in range(d, d + s)):
                         max_reachable += s
                         d += s
                         placed = True
@@ -299,7 +335,7 @@ def _build_model(
     # ── Availability ──────────────────────────────────────────────────────
     for e, emp in enumerate(employees):
         for d in range(D):
-            if not emp.availability[d]:
+            if emp.availability[d] == AVAIL_NO:
                 model.Add(shift[e][d] == 0)
 
     # ── Block structure ───────────────────────────────────────────────────
@@ -310,7 +346,7 @@ def _build_model(
         for d in range(D):
             for s in allowed_sizes:
                 if d + s <= D:
-                    if all(emp.availability[dd] for dd in range(d, d + s)):
+                    if all(emp.availability[dd] > AVAIL_NO for dd in range(d, d + s)):
                         block_start[(d, s)] = model.NewBoolVar(f"bs_e{e}_d{d}_s{s}")
 
         eight_block_vars: List[Tuple[int, object]] = []
@@ -318,7 +354,7 @@ def _build_model(
             for d in range(D):
                 if d + 9 <= D:
                     work_days_8 = list(range(d, d + 4)) + list(range(d + 5, d + 9))
-                    if all(emp.availability[dd] for dd in work_days_8):
+                    if all(emp.availability[dd] > AVAIL_NO for dd in work_days_8):
                         eight_block_vars.append((d, model.NewBoolVar(f"8blk_e{e}_d{d}")))
 
         for d in range(D):
@@ -463,6 +499,16 @@ def _build_model(
     # Aber innerhalb [min, max] wählt der Solver aktiv die beste Anzahl.
     objective_terms = []
 
+    # ── Priorität 0: Verfügbarkeits-Präferenz berücksichtigen ────────────
+    # maybe/rather-not Tage werden mit einer Strafe belegt damit der Solver
+    # yes-Tage bevorzugt, aber bei Bedarf auf schwächere Verfügbarkeiten
+    # zurückgreift.
+    for e, emp in enumerate(employees):
+        for d in range(D):
+            penalty = AVAIL_PENALTY.get(emp.availability[d], 0)
+            if penalty and penalty is not None:
+                objective_terms.append(-penalty * shift[e][d])
+
     # ── Priorität 1: Unterbesetzung stark bestrafen ───────────────────────
     for sf in shortfall_day:
         objective_terms.append(-10000 * sf)
@@ -546,10 +592,10 @@ def _pre_solve_diagnostics(
         req = requirement_for_day(day, month, year)
 
         # How many employees could possibly work this day
-        # (available + have at least one valid block covering this day)
+        # (available = not AVAIL_NO + have at least one valid block covering this day)
         can_work = 0
         for e, emp in enumerate(employees):
-            if not emp.availability[d]:
+            if emp.availability[d] == AVAIL_NO:
                 continue
             # Check if any block of their preferred sizes covers day d
             has_block = False
@@ -557,7 +603,7 @@ def _pre_solve_diagnostics(
                 for start in range(max(0, d - s + 1), d + 1):
                     end = start + s
                     if end <= days_in_month:
-                        if all(emp.availability[dd] for dd in range(start, end)):
+                        if all(emp.availability[dd] > AVAIL_NO for dd in range(start, end)):
                             has_block = True
                             break
                 if has_block:
@@ -567,7 +613,7 @@ def _pre_solve_diagnostics(
                 for start in range(days_in_month):
                     if start + 9 <= days_in_month:
                         work_days = list(range(start, start+4)) + list(range(start+5, start+9))
-                        if d in work_days and all(emp.availability[dd] for dd in work_days):
+                        if d in work_days and all(emp.availability[dd] > AVAIL_NO for dd in work_days):
                             has_block = True
                             break
             if has_block:
@@ -583,7 +629,7 @@ def _pre_solve_diagnostics(
         # Fachkraft check
         fk_can_work = sum(
             1 for e in fachkraft_indices
-            if employees[e].availability[d]
+            if employees[e].availability[d] > AVAIL_NO
         )
         if fk_can_work == 0:
             issues.append(
@@ -593,7 +639,7 @@ def _pre_solve_diagnostics(
 
     # Min-services reachability per employee
     for emp in employees:
-        avail_count = sum(emp.availability)
+        avail_count = sum(1 for x in emp.availability if x > AVAIL_NO)
         if avail_count < emp.min_services:
             issues.append(
                 f"⚠️ {emp.name}: nur {avail_count} verfügbare Tage, "
@@ -840,13 +886,19 @@ def build_input_overview_excel(
         ws[f"E{row_idx}"] = ",".join(str(x) for x in sorted(emp.block_preferences))
         ws[f"F{row_idx}"] = "Ja" if emp.wants_8_block else "Nein"
 
-        for day_idx, available in enumerate(emp.availability, start=1):
+        for day_idx, avail_level in enumerate(emp.availability, start=1):
             col = get_column_letter(6 + day_idx)
             cell = ws[f"{col}{row_idx}"]
-            cell.value = "Ja" if available else "Nein"
+            if avail_level == AVAIL_YES:
+                cell.value = "Yes"
+            elif avail_level == AVAIL_MAYBE:
+                cell.value = "Maybe"
+            elif avail_level == AVAIL_RATHER_NOT:
+                cell.value = "Rather not"
+            else:
+                cell.value = "No"
             cell.alignment = Alignment(horizontal="center", vertical="center")
-            if available:
-                cell.fill = GREEN_FILL
+            cell.fill = AVAIL_FILL.get(avail_level, FILL_NO)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -900,8 +952,17 @@ def build_schedule_excel(
             cell = ws[f"{col}{row_idx}"]
             cell.alignment = Alignment(horizontal="center", vertical="center")
             if emp_idx in assigned_sets[d0]:
+                avail_level = emp.availability[d0]
                 cell.value = "X"
-                cell.fill = GREEN_FILL
+                # Colour the X by availability preference
+                if avail_level == AVAIL_YES:
+                    cell.fill = FILL_YES
+                elif avail_level == AVAIL_MAYBE:
+                    cell.fill = FILL_MAYBE
+                elif avail_level == AVAIL_RATHER_NOT:
+                    cell.fill = FILL_RATHER_NOT
+                else:
+                    cell.fill = FILL_YES  # fallback
                 service_count += 1
 
         ws[f"{sum_col}{row_idx}"] = service_count
@@ -1009,7 +1070,7 @@ default_min_services = 8
 default_max_services = 15
 default_blocks = [2]
 default_wants_8 = False
-default_availability = [True] * days_in_month
+default_availability = [AVAIL_YES] * days_in_month
 
 if existing_input:
     default_is_fachkraft = bool(existing_input.get("is_fachkraft", False))
@@ -1021,7 +1082,15 @@ if existing_input:
     if isinstance(loaded_blocks, list):
         default_blocks = [int(x) for x in loaded_blocks if str(x).isdigit() and int(x) in [1, 2, 3, 4]]
     if isinstance(loaded_availability, list) and len(loaded_availability) == days_in_month:
-        default_availability = [bool(x) for x in loaded_availability]
+        # Support both old bool format and new int format
+        converted = []
+        for x in loaded_availability:
+            if isinstance(x, bool):
+                converted.append(AVAIL_YES if x else AVAIL_NO)
+            else:
+                v = int(x)
+                converted.append(v if v in (AVAIL_YES, AVAIL_MAYBE, AVAIL_RATHER_NOT, AVAIL_NO) else AVAIL_NO)
+        default_availability = converted
 
 with st.form("employee_form"):
     is_fachkraft = st.checkbox("Fachkraft", value=default_is_fachkraft)
@@ -1035,16 +1104,28 @@ with st.form("employee_form"):
     wants_8_block = st.checkbox("8er-Block-Wunsch (4 + frei + 4)", value=default_wants_8)
 
     st.write("Verfügbarkeit")
+    st.caption("✅ Yes = verfügbar · 🟡 Maybe = okay · 🟠 Rather not = nur wenn nötig · ❌ No = nicht verfügbar")
     availability = []
-    cols = st.columns(7)
-    for d in range(1, days_in_month + 1):
-        with cols[(d - 1) % 7]:
-            available = st.checkbox(
-                get_day_label(d, int(month), int(year)),
-                value=default_availability[d - 1],
-                key=f"{employee_id}_day_{month}_{year}_{d}",
+    # Show days in rows of 7 (one week per row)
+    for week_start in range(0, days_in_month, 7):
+        week_days = list(range(week_start, min(week_start + 7, days_in_month)))
+        cols = st.columns(len(week_days))
+        for col_offset, d in enumerate(week_days):
+            day_num = d + 1
+            label = get_day_label(day_num, int(month), int(year))
+            current_level = default_availability[d]
+            # Find matching display key
+            current_key = next(
+                (k for k, v in AVAIL_OPTIONS.items() if v == current_level),
+                "✅ Yes (100%)"
             )
-            availability.append(available)
+            chosen_key = cols[col_offset].selectbox(
+                label,
+                options=list(AVAIL_OPTIONS.keys()),
+                index=list(AVAIL_OPTIONS.keys()).index(current_key),
+                key=f"{employee_id}_day_{month}_{year}_{day_num}",
+            )
+            availability.append(AVAIL_OPTIONS[chosen_key])
 
     submitted = st.form_submit_button("Speichern")
 
@@ -1162,7 +1243,7 @@ if admin_mode:
         # 1) Verfügbarkeit pro Mitarbeiter
         st.markdown("**Verfügbarkeit pro Mitarbeiter:**")
         for emp in employees_for_plan:
-            avail_count = sum(emp.availability)
+            avail_count = sum(1 for x in emp.availability if x > AVAIL_NO)
             avail_pct = int(avail_count / days_in_month * 100)
             if avail_count == 0:
                 st.error(
@@ -1204,7 +1285,7 @@ if admin_mode:
         st.markdown("**Kritische Tage (zu wenig verfügbare Mitarbeiter):**")
         critical_days = []
         for d in range(days_in_month):
-            available_today = sum(1 for emp in employees_for_plan if emp.availability[d])
+            available_today = sum(1 for emp in employees_for_plan if emp.availability[d] > AVAIL_NO)
             req = requirement_for_day(d + 1, int(month), int(year))
             if available_today < req.minimum:
                 critical_days.append((d + 1, available_today, req.minimum))
@@ -1332,11 +1413,25 @@ if admin_mode:
                         for d in range(days_in_month):
                             if e in assigned_sets[d]:
                                 count += 1
-                                bg = "#27ae60" if e in fachkraft_set else "#90EE90"
-                                fg = "white" if e in fachkraft_set else "#1a1a1a"
+                                avail_level = emp.availability[d]
+                                is_fk = e in fachkraft_set
+                                # Base colour from availability level; Fachkraft gets darker shade
+                                if avail_level == AVAIL_YES:
+                                    bg = "#27ae60" if is_fk else "#90EE90"
+                                    fg = "white" if is_fk else "#1a1a1a"
+                                    marker = "X"
+                                elif avail_level == AVAIL_MAYBE:
+                                    bg = "#c8a800" if is_fk else "#FFFF99"
+                                    fg = "white" if is_fk else "#1a1a1a"
+                                    marker = "X?"
+                                else:  # AVAIL_RATHER_NOT
+                                    bg = "#c0630a" if is_fk else "#FFD580"
+                                    fg = "white" if is_fk else "#1a1a1a"
+                                    marker = "X!"
                                 cells.append(
                                     f'<td style="background:{bg};color:{fg};text-align:center;'
-                                    f'padding:3px;font-weight:bold;font-size:12px">X</td>'
+                                    f'padding:3px;font-weight:bold;font-size:12px" '
+                                    f'title="Verfügbarkeit: {avail_level}%">{marker}</td>'
                                 )
                             else:
                                 cells.append(
@@ -1383,8 +1478,10 @@ if admin_mode:
                         + "</table></div>"
                         "<p style='font-size:11px;color:#888;margin-top:6px'>"
                         "⭐ = Fachkraft &nbsp;|&nbsp; "
-                        "<span style='background:#27ae60;color:white;padding:1px 6px;border-radius:3px'>X</span> Fachkraft &nbsp;|&nbsp; "
-                        "<span style='background:#90EE90;padding:1px 6px;border-radius:3px'>X</span> Mitarbeiter &nbsp;|&nbsp; "
+                        "<span style='background:#27ae60;color:white;padding:1px 6px;border-radius:3px'>X</span> Fachkraft (Yes) &nbsp;|&nbsp; "
+                        "<span style='background:#90EE90;padding:1px 6px;border-radius:3px'>X</span> Yes &nbsp;|&nbsp; "
+                        "<span style='background:#FFFF99;padding:1px 6px;border-radius:3px'>X?</span> Maybe &nbsp;|&nbsp; "
+                        "<span style='background:#FFD580;padding:1px 6px;border-radius:3px'>X!</span> Rather not &nbsp;|&nbsp; "
                         "<span style='background:#e74c3c;color:white;padding:1px 6px;border-radius:3px'>n</span> Unterbesetzt &nbsp;|&nbsp; "
                         "<span style='background:#f39c12;color:white;padding:1px 6px;border-radius:3px'>n</span> Keine Fachkraft"
                         "</p>"
